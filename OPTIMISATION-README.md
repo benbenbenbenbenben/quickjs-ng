@@ -122,8 +122,13 @@ Both handlers check for `CONFIG_INLINE_ARRAY_GET` at compile time:
 Potential future optimizations:
 - Inline fast path for array writes (`OP_put_array_el`)
 - Special opcodes for constant array indices (e.g., `arr[0]`, `arr[1]`)
-- Inline fast path for typed array access
 - Profile-guided optimization hints
+
+### Attempted Optimizations
+
+#### Typed Array Inline Access
+
+An inline fast path for typed array element access (`-Dinline-typed-array-get`) was attempted but showed performance degradation (4.22 ns → 9.24 ns for `typed_array_read` benchmark). The overhead of the switch statement for handling different typed array types outweighs the benefit of avoiding the function call. The existing implementation through `JS_GetPropertyValue()` is already well-optimized.
 
 ### See Also
 
