@@ -18953,6 +18953,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue val;
 
                 sf->cur_pc = pc;
+#ifdef CONFIG_INLINE_ARRAY_GET
+                {
+                    /* Inline fast path for array access */
+                    JSValue obj_val = sp[-2];
+                    JSValue prop_val = sp[-1];
+                    uint32_t obj_tag = JS_VALUE_GET_TAG(obj_val);
+                    
+                    if (likely(obj_tag == JS_TAG_OBJECT)) {
+                        uint32_t prop_tag = JS_VALUE_GET_TAG(prop_val);
+                        if (likely(prop_tag == JS_TAG_INT)) {
+                            JSObject *p = JS_VALUE_GET_OBJ(obj_val);
+                            uint32_t idx = JS_VALUE_GET_INT(prop_val);
+                            if (likely(p->class_id == JS_CLASS_ARRAY && idx < p->u.array.count)) {
+                                val = js_dup(p->u.array.u.values[idx]);
+                                JS_FreeValue(ctx, obj_val);
+                                sp[-2] = val;
+                                sp--;
+                                if (unlikely(JS_IsException(val)))
+                                    goto exception;
+                                BREAK;
+                            }
+                        }
+                    }
+                }
+#endif
                 val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
                 JS_FreeValue(ctx, sp[-2]);
                 sp[-2] = val;
@@ -18967,6 +18992,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue val;
 
                 sf->cur_pc = pc;
+#ifdef CONFIG_INLINE_ARRAY_GET
+                {
+                    /* Inline fast path for array access */
+                    JSValue obj_val = sp[-2];
+                    JSValue prop_val = sp[-1];
+                    uint32_t obj_tag = JS_VALUE_GET_TAG(obj_val);
+                    
+                    if (likely(obj_tag == JS_TAG_OBJECT)) {
+                        uint32_t prop_tag = JS_VALUE_GET_TAG(prop_val);
+                        if (likely(prop_tag == JS_TAG_INT)) {
+                            JSObject *p = JS_VALUE_GET_OBJ(obj_val);
+                            uint32_t idx = JS_VALUE_GET_INT(prop_val);
+                            if (likely(p->class_id == JS_CLASS_ARRAY && idx < p->u.array.count)) {
+                                val = js_dup(p->u.array.u.values[idx]);
+                                sp[-1] = val;
+                                if (unlikely(JS_IsException(val)))
+                                    goto exception;
+                                BREAK;
+                            }
+                        }
+                    }
+                }
+#endif
                 val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
                 sp[-1] = val;
                 if (unlikely(JS_IsException(val)))

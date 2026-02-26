@@ -12,6 +12,7 @@ pub fn build(b: *std.Build) !void {
     const build_libc = b.option(bool, "libc", "Build standard library modules as part of the library") orelse false;
     const static_cli = b.option(bool, "static-cli", "Build a static qjs executable") orelse false;
     const disable_parser = b.option(bool, "no-parser", "Disable JS source code parser") orelse false;
+    const inline_array_get = b.option(bool, "inline-array-get", "Inline array element access fast path") orelse false;
 
     // Determine version from quickjs.h
     const version = .{
@@ -65,6 +66,11 @@ pub fn build(b: *std.Build) !void {
 
     if (build_libc) {
         c_flags[c_flags_len] = "-DQJS_BUILD_LIBC";
+        c_flags_len += 1;
+    }
+
+    if (inline_array_get) {
+        c_flags[c_flags_len] = "-DCONFIG_INLINE_ARRAY_GET";
         c_flags_len += 1;
     }
 
