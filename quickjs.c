@@ -8635,6 +8635,34 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                 if (__JS_AtomIsTaggedInt(prop)) {
                     uint32_t idx = __JS_AtomToUInt32(prop);
                     if (idx < p->u.array.count) {
+#ifdef CONFIG_INLINE_ARRAY_GET
+                        /* inline fast path for array element access */
+                        switch(p->class_id) {
+                        case JS_CLASS_ARRAY:
+                        case JS_CLASS_ARGUMENTS:
+                            return js_dup(p->u.array.u.values[idx]);
+                        case JS_CLASS_INT8_ARRAY:
+                            return js_int32(p->u.array.u.int8_ptr[idx]);
+                        case JS_CLASS_UINT8C_ARRAY:
+                        case JS_CLASS_UINT8_ARRAY:
+                            return js_int32(p->u.array.u.uint8_ptr[idx]);
+                        case JS_CLASS_INT16_ARRAY:
+                            return js_int32(p->u.array.u.int16_ptr[idx]);
+                        case JS_CLASS_UINT16_ARRAY:
+                            return js_int32(p->u.array.u.uint16_ptr[idx]);
+                        case JS_CLASS_INT32_ARRAY:
+                            return js_int32(p->u.array.u.int32_ptr[idx]);
+                        case JS_CLASS_UINT32_ARRAY:
+                            return js_uint32(p->u.array.u.uint32_ptr[idx]);
+                        case JS_CLASS_FLOAT32_ARRAY:
+                            return js_float64(p->u.array.u.float_ptr[idx]);
+                        case JS_CLASS_FLOAT64_ARRAY:
+                            return js_float64(p->u.array.u.double_ptr[idx]);
+                        default:
+                            /* fall through to generic path */
+                            break;
+                        }
+#endif
                         /* we avoid duplicating the code */
                         return JS_GetPropertyUint32(ctx, JS_MKPTR(JS_TAG_OBJECT, p), idx);
                     } else if (is_typed_array(p->class_id)) {

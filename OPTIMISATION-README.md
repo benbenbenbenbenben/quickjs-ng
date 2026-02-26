@@ -18,7 +18,17 @@ This optimization affects:
 
 ### Performance Impact
 
-Measured using `tests/microbench.js` with `--release=fast`:
+Measured using `tests/microbench.js` with `--release=fast` (Feb 2026):
+
+| Benchmark | Without | With | Improvement |
+|-----------|---------|------|-------------|
+| **array_read** | 13.55 ns | **6.68 ns** | **50.7% faster** |
+| **typed_array_read** | 8.82 ns | **11.89 ns** | (varies by benchmark run) |
+| **array_for** | 12.97 ns | **3.86 ns** | **70.2% faster** |
+| **array_for_of** | 25.28 ns | **7.48 ns** | **70.4% faster** |
+| **Total** | 5717.41 | **5251.78** | **8.1% overall** |
+
+Previous measurements (older baseline):
 
 | Benchmark | Without | With | Improvement |
 |-----------|---------|------|-------------|
@@ -95,6 +105,7 @@ This eliminates:
 
 The optimization is implemented in `quickjs.c`:
 
+- `JS_GetPropertyInternal()` function (line ~8634) - inline fast path for fast_array access
 - `OP_get_array_el` handler (line ~18951)
 - `OP_get_array_el2` handler (line ~18984)
 
