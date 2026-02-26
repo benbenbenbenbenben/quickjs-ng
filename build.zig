@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) !void {
     const static_cli = b.option(bool, "static-cli", "Build a static qjs executable") orelse false;
     const disable_parser = b.option(bool, "no-parser", "Disable JS source code parser") orelse false;
     const inline_array_get = b.option(bool, "inline-array-get", "Inline array element access fast path") orelse false;
+    const map_init_hash_size = b.option(bool, "map-init-hash-size", "Use larger initial hash table size for Map/Set") orelse false;
 
     // Determine version from quickjs.h
     const version = .{
@@ -71,6 +72,11 @@ pub fn build(b: *std.Build) !void {
 
     if (inline_array_get) {
         c_flags[c_flags_len] = "-DCONFIG_INLINE_ARRAY_GET";
+        c_flags_len += 1;
+    }
+
+    if (map_init_hash_size) {
+        c_flags[c_flags_len] = "-DCONFIG_MAP_INIT_HASH_SIZE";
         c_flags_len += 1;
     }
 

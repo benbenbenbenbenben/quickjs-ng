@@ -50537,12 +50537,21 @@ static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
     init_list_head(&s->records);
     s->is_weak = is_weak;
     JS_SetOpaqueInternal(obj, s);
+#ifdef CONFIG_MAP_INIT_HASH_SIZE
+    s->hash_size = 16;
+#else
     s->hash_size = 1;
+#endif
     s->hash_table = js_malloc(ctx, sizeof(s->hash_table[0]) * s->hash_size);
     if (!s->hash_table)
         goto fail;
-    init_list_head(&s->hash_table[0]);
+    for (int i = 0; i < s->hash_size; i++)
+        init_list_head(&s->hash_table[i]);
+#ifdef CONFIG_MAP_INIT_HASH_SIZE
+    s->record_count_threshold = 32;
+#else
     s->record_count_threshold = 4;
+#endif
 
     arr = JS_UNDEFINED;
     if (argc > 0)
