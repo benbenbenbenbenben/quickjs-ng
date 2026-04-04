@@ -1641,13 +1641,8 @@ void js_free_rt(JSRuntime *rt, void *ptr)
         return;
 
     s = &rt->malloc_state;
-    size_t free_size = rt->mf.js_malloc_usable_size(ptr) + MALLOC_OVERHEAD;
-    if (unlikely(free_size > s->malloc_size)) {
-        printf("js_free_rt: malloc_size underflow: freeing %zu but only %zu tracked\n", free_size, s->malloc_size);
-        abort();
-    }
     s->malloc_count--;
-    s->malloc_size -= free_size;
+    s->malloc_size -= rt->mf.js_malloc_usable_size(ptr) + MALLOC_OVERHEAD;
     rt->mf.js_free(s->opaque, ptr);
 }
 
@@ -10300,6 +10295,16 @@ retry:
                 goto fail;
             pr->u.value = val;
             return true;
+        }
+    }
+
+    if (p == p1 && !p->is_exotic) {
+        pr = add_property(ctx, p, prop, JS_PROP_C_W_E);
+        if (pr) {
+            pr->u.value = val;
+            return true;
+        } else {
+            goto fail;
         }
     }
 
@@ -51391,8 +51396,7 @@ static void map_hash_resize(JSContext *ctx, JSMapState *s)
         new_hash_size = 4;
     else
         new_hash_size = s->hash_size * 2;
-    new_hash_table = js_realloc(ctx, s->hash_table,
-                                sizeof(new_hash_table[0]) * new_hash_size);
+    new_hash_table = js_mallocz(ctx, sizeof(new_hash_table[0]) * new_hash_size);
     if (!new_hash_table)
         return;
 
@@ -51406,6 +51410,7 @@ static void map_hash_resize(JSContext *ctx, JSMapState *s)
             list_add_tail(&mr->hash_link, &new_hash_table[h]);
         }
     }
+    js_free(ctx, s->hash_table);
     s->hash_table = new_hash_table;
     s->hash_size = new_hash_size;
     s->record_count_threshold = new_hash_size * 2;
