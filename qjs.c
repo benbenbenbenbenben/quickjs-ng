@@ -40,6 +40,10 @@
 #include <mimalloc.h>
 #endif
 
+#ifdef QJS_ENABLE_DAP
+#include "qjs-dap.h"
+#endif
+
 extern const uint8_t qjsc_repl[];
 extern const uint32_t qjsc_repl_size;
 extern const uint8_t qjsc_standalone[];
@@ -422,6 +426,10 @@ int main(int argc, char **argv)
     int i, include_count = 0;
     int64_t memory_limit = -1;
     int64_t stack_size = -1;
+#ifdef QJS_ENABLE_DAP
+    int use_dap = 0;
+    int dap_port = -1;
+#endif
 
     /* save for later */
     qjs__argc = argc;
@@ -581,6 +589,15 @@ int main(int argc, char **argv)
             if (opt) {
                 fprintf(stderr, "qjs: unknown option '-%c'\n", opt);
             } else {
+#ifdef QJS_ENABLE_DAP
+                if (!strncmp(longopt, "dap", 3)) {
+                    use_dap = 1;
+                    if (optarg && !strncmp(optarg, "tcp:", 4)) {
+                        dap_port = atoi(optarg + 4);
+                    }
+                    break;
+                }
+#endif
                 fprintf(stderr, "qjs: unknown option '--%s'\n", longopt);
             }
             help();
@@ -626,8 +643,23 @@ start:
     /* exit on unhandled promise rejections */
     JS_SetHostPromiseRejectionTracker(rt, js_std_promise_rejection_tracker, NULL);
 
+#ifdef QJS_ENABLE_DAP
+    DAPServer *dap_server = NULL;
+    if (use_dap) {
+        DAPTransport *t = dap_port > 0 ? DAP_NewTCPTransport(dap_port) : DAP_NewStdioTransport();
+        dap_server = DAP_NewServer(ctx, t);
+        DAP_WaitForLaunch(dap_server);
+    }
+#endif
+
     if (!empty_run) {
         js_std_add_helpers(ctx, argc - optind, argv + optind);
+
+#ifdef QJS_ENABLE_DAP
+        if (use_dap && dap_server) {
+            DAP_SetupOutputRedirection(dap_server);
+        }
+#endif
 
         /* make 'std' and 'os' visible to non module code */
         if (load_std) {
@@ -702,9 +734,22 @@ start:
         }
         if (r) {
             js_std_dump_error(ctx);
+#ifdef QJS_ENABLE_DAP
+            if (dap_server) DAP_ProcessExited(dap_server, 1);
+#endif
             goto fail;
+        } else {
+#ifdef QJS_ENABLE_DAP
+            if (dap_server) DAP_ProcessExited(dap_server, 0);
+#endif
         }
     }
+
+#ifdef QJS_ENABLE_DAP
+    if (dap_server) {
+        DAP_FreeServer(dap_server);
+    }
+#endif
 
     if (dump_memory) {
         JSMemoryUsage stats;

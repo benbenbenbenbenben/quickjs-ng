@@ -40,6 +40,7 @@ xoption(QJS_ENABLE_ASAN "Enable AddressSanitizer (ASan)" OFF)
 xoption(QJS_ENABLE_MSAN "Enable MemorySanitizer (MSan)" OFF)
 xoption(QJS_ENABLE_TSAN "Enable ThreadSanitizer (TSan)" OFF)
 xoption(QJS_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer (UBSan)" OFF)
+xoption(QJS_ENABLE_DAP "Enable DAP debugging support" OFF)
 
 # Used to properly define JS_LIBC_EXTERN.
 add_compile_definitions(QUICKJS_NG_BUILD)
@@ -275,6 +276,9 @@ if(QJS_BUILD_LIBC)
     # The definition must be added to the entire project.
     add_compile_definitions(QJS_BUILD_LIBC)
 endif()
+if(QJS_ENABLE_DAP)
+    list(APPEND qjs_sources qjs-debug.c)
+endif()
 list(APPEND qjs_defines _GNU_SOURCE)
 if(WIN32)
     # NB: Windows 7 is EOL and we are only supporting in so far as it doesn't interfere with progress.
@@ -382,6 +386,9 @@ add_static_if_needed(qjs_exe)
 set_target_properties(qjs_exe PROPERTIES
     OUTPUT_NAME "qjs"
 )
+if(QJS_ENABLE_DAP)
+    target_sources(qjs_exe PRIVATE qjs-dap.c)
+endif()
 target_compile_definitions(qjs_exe PRIVATE ${qjs_defines})
 target_link_libraries(qjs_exe PRIVATE qjs)
 if (NOT WIN32)

@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) !void {
     const disable_parser = b.option(bool, "no-parser", "Disable JS source code parser") orelse false;
     const inline_array_get = b.option(bool, "inline-array-get", "Inline array element access fast path") orelse false;
     const map_init_hash_size = b.option(bool, "map-init-hash-size", "Use larger initial hash table size for Map/Set") orelse false;
+    const build_dap = b.option(bool, "dap", "Enable DAP debugging support") orelse false;
 
     // Determine version from quickjs.h
     const version = .{
@@ -78,6 +79,11 @@ pub fn build(b: *std.Build) !void {
         c_flags_len += 1;
     }
 
+    if (build_dap) {
+        c_flags[c_flags_len] = "-DQJS_ENABLE_DAP";
+        c_flags_len += 1;
+    }
+
     // Platform-specific flags
     const os_tag = target.result.os.tag;
     const is_windows = os_tag == .windows;
@@ -130,6 +136,13 @@ pub fn build(b: *std.Build) !void {
     for (&qjs_sources) |src| {
         qjs_lib.root_module.addCSourceFile(.{
             .file = b.path(src),
+            .flags = flags_slice,
+        });
+    }
+
+    if (build_dap) {
+        qjs_lib.root_module.addCSourceFile(.{
+            .file = b.path("qjs-debug.c"),
             .flags = flags_slice,
         });
     }
@@ -258,6 +271,13 @@ pub fn build(b: *std.Build) !void {
         for (&qjs_exe_sources) |src| {
             qjs_exe.root_module.addCSourceFile(.{
                 .file = b.path(src),
+                .flags = flags_slice,
+            });
+        }
+
+        if (build_dap) {
+            qjs_exe.root_module.addCSourceFile(.{
+                .file = b.path("qjs-dap.c"),
                 .flags = flags_slice,
             });
         }
@@ -558,5 +578,6 @@ pub fn build(b: *std.Build) !void {
     std.debug.print("  Werror: {}\n", .{build_werror});
     std.debug.print("  Examples: {}\n", .{build_examples});
     std.debug.print("  Build libc into lib: {}\n", .{build_libc});
+    std.debug.print("  DAP Support: {}\n", .{build_dap});
     std.debug.print("\n", .{});
 }

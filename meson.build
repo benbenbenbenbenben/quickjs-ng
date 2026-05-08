@@ -139,6 +139,11 @@ qjs_srcs = files(
   'libunicode.c',
   'quickjs.c',
 )
+
+if get_option('dap')
+  qjs_srcs += files('qjs-debug.c')
+endif
+
 qjs_hdrs = files(
   'quickjs.h',
 )
@@ -165,6 +170,10 @@ endif
 
 if not qjs_parser
   qjs_c_args += ['-DQJS_DISABLE_PARSER']
+endif
+
+if get_option('dap')
+  qjs_c_args += ['-DQJS_ENABLE_DAP']
 endif
 
 qjs_lib = library(
@@ -328,6 +337,11 @@ qjs_exe_srcs = files(
   'gen/standalone.c',
   'qjs.c',
 )
+
+if get_option('dap')
+  qjs_exe_srcs += files('qjs-dap.c')
+endif
+
 qjs_exe = executable(
   'qjs',
   qjs_exe_srcs,

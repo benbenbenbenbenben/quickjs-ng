@@ -1149,6 +1149,46 @@ JS_EXTERN void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRej
 /* return != 0 if the JS code needs to be interrupted */
 typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
 JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
+
+/* Debugger API */
+typedef enum {
+    JS_DEBUG_REASON_POLL = 0,
+    JS_DEBUG_REASON_BREAKPOINT = 1,
+    JS_DEBUG_REASON_STEP = 2,
+    JS_DEBUG_REASON_EXCEPTION = 3,
+    JS_DEBUG_REASON_DEBUGGER = 4,
+    JS_DEBUG_REASON_EXIT = 5,
+    JS_DEBUG_REASON_ENTRY = 6,
+} JSDebugReason;
+
+typedef int JSDebugHandler(JSRuntime *rt, void *opaque,
+                           JSDebugReason reason,
+                           const uint8_t *pc);
+
+JS_EXTERN void JS_SetDebugHandler(JSRuntime *rt, JSDebugHandler *cb, void *opaque);
+
+typedef struct JSStackFrameInfo {
+    JSValue func;           /* Function object */
+    JSAtom filename;        /* Source file */
+    int line;               /* Current line */
+    int col;                /* Current column */
+    JSAtom func_name;       /* Function name */
+} JSStackFrameInfo;
+
+JS_EXTERN int JS_GetStackTrace(JSContext *ctx, JSStackFrameInfo **frames, int max_frames);
+JS_EXTERN int JS_GetStackDepth(JSContext *ctx);
+
+typedef struct JSVarInfo {
+    JSAtom name;
+    JSValue value;
+    int frame_index;        /* 0 = top frame */
+} JSVarInfo;
+
+JS_EXTERN int JS_GetFrameLocals(JSContext *ctx, int frame_index, JSVarInfo **vars);
+JS_EXTERN JSValue JS_EvaluateAtFrame(JSContext *ctx, int frame_index, const char *expr, size_t expr_len);
+JS_EXTERN int JS_GetGlobalVariables(JSContext *ctx, JSVarInfo **vars);
+JS_EXTERN int JS_GetPCLineNumber(JSContext *ctx, JSValueConst func, uint32_t pc);
+
 /* if can_block is true, Atomics.wait() can be used */
 JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
 /* set the [IsHTMLDDA] internal slot */

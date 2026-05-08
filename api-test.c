@@ -716,12 +716,14 @@ static void dump_memory_usage(void)
     JSValue evalVal = JS_Eval(ctx, code, strlen(code), "<input>", 0);
     JS_FreeValue(ctx, evalVal);
 
+#if !defined(__wasi__)
     FILE *temp = tmpfile();
     assert(temp != NULL);
     JS_ComputeMemoryUsage(rt, &stats);
     JS_DumpMemoryUsage(temp, &stats, rt);
     // JS_DumpMemoryUsage(stdout, &stats, rt);
     fclose(temp);
+#endif
 
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
@@ -1027,6 +1029,42 @@ static void new_symbol(void)
     JS_FreeRuntime(rt);
 }
 
+#ifdef QJS_ENABLE_DAP
+#include "qjs-debug.h"
+
+static int test_dap_pause_count = 0;
+
+static int test_dap_pause_cb(JSRuntime *rt, void *opaque, JSDebugReason reason, const uint8_t *pc) {
+    test_dap_pause_count++;
+    JSDebugState *ds = (JSDebugState *)opaque;
+    JS_DebugContinue(ds); // Automatically resume after pausing
+    return 0;
+}
+
+static void test_dap_breakpoints(void) {
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    
+    JSDebugState *ds = JS_NewDebugState(ctx);
+    test_dap_pause_count = 0;
+    ds->pause_callback = test_dap_pause_cb;
+    JS_SetDebugHandler(rt, js_debug_handler, ds);
+    
+    const char *code = "function f() { var x = 1; x++; return x; }\nf();";
+    JS_AddBreakpoint(ds, "<input>", 1, NULL); // Line 1
+    
+    JSValue ret = JS_Eval(ctx, code, strlen(code), "<input>", 0);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    
+    assert(test_dap_pause_count > 0);
+    
+    JS_FreeDebugState(ds);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+#endif
+
 int main(void)
 {
     cfunctions();
@@ -1047,5 +1085,8 @@ int main(void)
     immutable_array_buffer();
     get_uint8array();
     new_symbol();
+#ifdef QJS_ENABLE_DAP
+    test_dap_breakpoints();
+#endif
     return 0;
 }

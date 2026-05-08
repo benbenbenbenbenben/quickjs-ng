@@ -311,6 +311,12 @@ struct JSRuntime {
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
 
+#ifdef QJS_ENABLE_DAP
+    JSDebugHandler *debug_handler;
+    void *debug_opaque;
+    bool debug_enabled;
+#endif
+
     JSPromiseHook *promise_hook;
     void *promise_hook_opaque;
     // for smuggling the parent promise from js_promise_then
@@ -2093,6 +2099,15 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
 {
     rt->interrupt_handler = cb;
     rt->interrupt_opaque = opaque;
+}
+
+void JS_SetDebugHandler(JSRuntime *rt, JSDebugHandler *cb, void *opaque)
+{
+#ifdef QJS_ENABLE_DAP
+    rt->debug_handler = cb;
+    rt->debug_opaque = opaque;
+    rt->debug_enabled = (cb != NULL);
+#endif
 }
 
 void JS_SetCanBlock(JSRuntime *rt, bool can_block)
@@ -7566,6 +7581,13 @@ JSValue JS_Throw(JSContext *ctx, JSValue obj)
     JSRuntime *rt = ctx->rt;
     JS_FreeValue(ctx, rt->current_exception);
     rt->current_exception = obj;
+    
+#ifdef QJS_ENABLE_DAP
+    if (unlikely(rt->debug_enabled)) {
+        rt->debug_handler(rt, rt->debug_opaque, JS_DEBUG_REASON_EXCEPTION, NULL);
+    }
+#endif
+
     return JS_EXCEPTION;
 }
 
@@ -17509,8 +17531,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define DUMP_BYTECODE_OR_DONT(pc)
 #endif
 
+#ifdef QJS_ENABLE_DAP
+#define DEBUG_POLL(pc) \
+    if (unlikely(ctx->rt->debug_enabled)) { \
+        int ret = ctx->rt->debug_handler(ctx->rt, ctx->rt->debug_opaque, \
+                                    JS_DEBUG_REASON_POLL, pc); \
+        if (ret) goto exception; \
+    }
+#else
+#define DEBUG_POLL(pc)
+#endif
+
 #if !DIRECT_DISPATCH
-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) switch (opcode = *pc++)
+#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) DEBUG_POLL(pc) switch (opcode = *pc++)
 #define CASE(op)        case op
 #define DEFAULT         default
 #define BREAK           break
@@ -17521,7 +17554,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #include "quickjs-opcode.h"
         [ OP_COUNT ... 255 ] = &&case_default
     };
-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
+#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) DEBUG_POLL(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
 #define BREAK           SWITCH(pc)
@@ -20136,6 +20169,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_initial_yield):
             ret_val = JS_UNDEFINED;
             goto done_generator;
+
+        CASE(OP_debugger):
+#ifdef QJS_ENABLE_DAP
+            if (unlikely(ctx->rt->debug_enabled)) {
+                int ret = ctx->rt->debug_handler(ctx->rt, ctx->rt->debug_opaque,
+                                            JS_DEBUG_REASON_DEBUGGER, pc - 1);
+                if (ret)
+                    goto exception;
+            }
+#endif
+            BREAK;
 
         CASE(OP_nop):
             BREAK;
@@ -29036,7 +29080,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         break;
 
     case TOK_DEBUGGER:
-        /* currently no debugger, so just skip the keyword */
+        emit_op(s, OP_debugger);
         if (next_token(s))
             goto fail;
         if (js_parse_expect_semi(s))
@@ -61948,6 +61992,168 @@ uintptr_t js_std_cmd(int cmd, ...) {
     va_end(ap);
 
     return rv;
+}
+
+/* --- DAP Debugger Public APIs --- */
+
+int JS_GetPCLineNumber(JSContext *ctx, JSValueConst func, uint32_t pc)
+{
+    int col = 0;
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT)
+        return -1;
+    JSObject *p = JS_VALUE_GET_OBJ(func);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return -1;
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    if (!b || !b->pc2line_buf)
+        return -1;
+    return find_line_num(ctx, b, pc, &col);
+}
+
+int JS_GetStackTrace(JSContext *ctx, JSStackFrameInfo **frames, int max_frames)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    int count = 0;
+    JSStackFrame *curr = sf;
+    
+    while (curr != NULL && count < max_frames) {
+        count++;
+        curr = curr->prev_frame;
+    }
+    
+    if (count == 0) {
+        *frames = NULL;
+        return 0;
+    }
+    
+    *frames = js_mallocz(ctx, count * sizeof(JSStackFrameInfo));
+    if (!*frames)
+        return -1;
+        
+    curr = sf;
+    for (int i = 0; i < count; i++) {
+        JSStackFrameInfo *info = &(*frames)[i];
+        info->func = JS_DupValue(ctx, curr->cur_func);
+        info->filename = JS_ATOM_NULL;
+        info->line = -1;
+        info->col = -1;
+        info->func_name = JS_ATOM_NULL;
+        
+        if (JS_VALUE_GET_TAG(curr->cur_func) == JS_TAG_OBJECT) {
+            JSObject *p = JS_VALUE_GET_OBJ(curr->cur_func);
+            if (p->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+                JSFunctionBytecode *b = p->u.func.function_bytecode;
+                if (b) {
+                    if (b->filename != JS_ATOM_NULL)
+                        info->filename = JS_DupAtom(ctx, b->filename);
+                    if (b->func_name != JS_ATOM_NULL)
+                        info->func_name = JS_DupAtom(ctx, b->func_name);
+                        
+                    if (curr->cur_pc) {
+                        info->line = find_line_num(ctx, b, curr->cur_pc - b->byte_code_buf - 1, &info->col);
+                    } else {
+                        info->line = b->line_num;
+                    }
+                }
+            } else if (p->class_id == JS_CLASS_C_FUNCTION || p->class_id == JS_CLASS_C_FUNCTION_DATA) {
+                JSPropertyDescriptor desc;
+                if (JS_GetOwnProperty(ctx, &desc, curr->cur_func, JS_ATOM_name) > 0) {
+                    if (JS_IsString(desc.value)) {
+                        info->func_name = JS_ValueToAtom(ctx, desc.value);
+                    }
+                    JS_FreeValue(ctx, desc.value);
+                }
+            }
+        }
+        curr = curr->prev_frame;
+    }
+    return count;
+}
+
+int JS_GetStackDepth(JSContext *ctx)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    int count = 0;
+    while (sf != NULL) {
+        count++;
+        sf = sf->prev_frame;
+    }
+    return count;
+}
+
+int JS_GetFrameLocals(JSContext *ctx, int frame_index, JSVarInfo **vars)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    int curr_idx = 0;
+    while (sf != NULL && curr_idx < frame_index) {
+        sf = sf->prev_frame;
+        curr_idx++;
+    }
+    if (!sf) return -1;
+
+    *vars = NULL;
+    if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+        return 0;
+    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return 0;
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    if (!b) return 0;
+
+    int total_vars = b->arg_count + b->var_count;
+    if (total_vars == 0) return 0;
+
+    *vars = js_mallocz(ctx, total_vars * sizeof(JSVarInfo));
+    if (!*vars) return -1;
+
+    for (int i = 0; i < total_vars; i++) {
+        JSVarDef *vd = &b->vardefs[i];
+        JSVarInfo *vi = &(*vars)[i];
+        vi->name = JS_DupAtom(ctx, vd->var_name);
+        if (i < b->arg_count) {
+            vi->value = JS_DupValue(ctx, sf->arg_buf[i]);
+        } else {
+            vi->value = JS_DupValue(ctx, sf->var_buf[i - b->arg_count]);
+        }
+        vi->frame_index = frame_index;
+    }
+    return total_vars;
+}
+
+JSValue JS_EvaluateAtFrame(JSContext *ctx, int frame_index, const char *expr, size_t expr_len)
+{
+    // Real implementation requires evaluating in the specific lexical environment.
+    // For now, this evaluates in the global scope if not fully implemented in quickjs.c.
+    // A complete implementation would involve setting up a custom JS_EVAL_FLAG_COMPILE_ONLY 
+    // and manually patching the closure vars, or just running in global context.
+    return JS_Eval(ctx, expr, expr_len, "<eval>", JS_EVAL_TYPE_GLOBAL);
+}
+
+int JS_GetGlobalVariables(JSContext *ctx, JSVarInfo **vars)
+{
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSPropertyEnum *ptab;
+    uint32_t plen;
+    if (JS_GetOwnPropertyNames(ctx, &ptab, &plen, global, JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0) {
+        JS_FreeValue(ctx, global);
+        return -1;
+    }
+    *vars = js_mallocz(ctx, plen * sizeof(JSVarInfo));
+    if (!*vars) {
+        js_free(ctx, ptab);
+        JS_FreeValue(ctx, global);
+        return -1;
+    }
+    for (uint32_t i = 0; i < plen; i++) {
+        JSVarInfo *vi = &(*vars)[i];
+        vi->name = JS_DupAtom(ctx, ptab[i].atom);
+        vi->value = JS_GetProperty(ctx, global, ptab[i].atom);
+        vi->frame_index = -1;
+        JS_FreeAtom(ctx, ptab[i].atom);
+    }
+    js_free(ctx, ptab);
+    JS_FreeValue(ctx, global);
+    return plen;
 }
 
 #undef malloc

@@ -58,8 +58,10 @@ fuzz:
 	clang -g -O1 -fsanitize=address,undefined,fuzzer -o fuzz fuzz.c
 	./fuzz
 
+QJS_ENABLE_DAP?=OFF
+
 $(BUILD_DIR):
-	cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DCMAKE_INSTALL_PREFIX=$(INSTALL_PREFIX)
+	cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DCMAKE_INSTALL_PREFIX=$(INSTALL_PREFIX) -DQJS_ENABLE_DAP=$(QJS_ENABLE_DAP)
 
 $(QJS): $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) -j $(JOBS)
