@@ -44,8 +44,6 @@ pub fn build(b: *std.Build) !void {
     c_flags_len += 1;
     c_flags[c_flags_len] = "-Wno-unused-result";
     c_flags_len += 1;
-    c_flags[c_flags_len] = "-Wno-stringop-truncation";
-    c_flags_len += 1;
     c_flags[c_flags_len] = "-Wno-array-bounds";
     c_flags_len += 1;
     c_flags[c_flags_len] = "-funsigned-char";
@@ -89,6 +87,18 @@ pub fn build(b: *std.Build) !void {
         c_flags[c_flags_len] = "-DWIN32_LEAN_AND_MEAN";
         c_flags_len += 1;
         c_flags[c_flags_len] = "-D_WIN32_WINNT=0x0601";
+        c_flags_len += 1;
+    }
+
+    if (!is_wasi) {
+        c_flags[c_flags_len] = "-Wno-stringop-truncation";
+        c_flags_len += 1;
+    }
+
+    if (is_wasi) {
+        c_flags[c_flags_len] = "-D_WASI_EMULATED_SIGNAL";
+        c_flags_len += 1;
+        c_flags[c_flags_len] = "-D_WASI_EMULATED_PROCESS_CLOCKS";
         c_flags_len += 1;
     }
 
@@ -136,6 +146,10 @@ pub fn build(b: *std.Build) !void {
     if (!is_wasi) {
         qjs_lib.linkSystemLibrary("pthread");
     }
+    if (is_wasi) {
+        qjs_lib.linkSystemLibrary("wasi-emulated-signal");
+        qjs_lib.linkSystemLibrary("wasi-emulated-process-clocks");
+    }
     qjs_lib.linkSystemLibrary("m");
 
     if (build_shared) {
@@ -171,6 +185,10 @@ pub fn build(b: *std.Build) !void {
         if (!is_wasi) {
             libc_lib.linkSystemLibrary("pthread");
         }
+        if (is_wasi) {
+            libc_lib.linkSystemLibrary("wasi-emulated-signal");
+            libc_lib.linkSystemLibrary("wasi-emulated-process-clocks");
+        }
         libc_lib.linkSystemLibrary("m");
         break :blk libc_lib;
     } else null;
@@ -197,147 +215,163 @@ pub fn build(b: *std.Build) !void {
         }
     }.add;
 
-    // qjsc - QuickJS bytecode compiler
-    const qjsc_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-    });
-    qjsc_mod.addIncludePath(b.path("."));
+    if (!is_wasi) {
+        // qjsc - QuickJS bytecode compiler
+        const qjsc_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        });
+        qjsc_mod.addIncludePath(b.path("."));
 
-    const qjsc = b.addExecutable(.{
-        .name = "qjsc",
-        .root_module = qjsc_mod,
-    });
-    qjsc.root_module.addCSourceFile(.{
-        .file = b.path("qjsc.c"),
-        .flags = flags_slice,
-    });
-    qjsc.linkLibC();
-    qjsc.linkLibrary(qjs_lib);
-    addQjsLibc(qjs_libc, qjsc);
-    addStatic(qjsc, static_cli);
-    b.installArtifact(qjsc);
-
-    // qjs - QuickJS CLI
-    const qjs_exe_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-    });
-    qjs_exe_mod.addIncludePath(b.path("."));
-
-    const qjs_exe = b.addExecutable(.{
-        .name = "qjs",
-        .root_module = qjs_exe_mod,
-    });
-
-    const qjs_exe_sources = [_][]const u8{
-        "gen/repl.c",
-        "gen/standalone.c",
-        "qjs.c",
-    };
-
-    for (&qjs_exe_sources) |src| {
-        qjs_exe.root_module.addCSourceFile(.{
-            .file = b.path(src),
+        const qjsc = b.addExecutable(.{
+            .name = "qjsc",
+            .root_module = qjsc_mod,
+        });
+        qjsc.root_module.addCSourceFile(.{
+            .file = b.path("qjsc.c"),
             .flags = flags_slice,
         });
+        qjsc.linkLibC();
+        qjsc.linkLibrary(qjs_lib);
+        addQjsLibc(qjs_libc, qjsc);
+        addStatic(qjsc, static_cli);
+        b.installArtifact(qjsc);
+
+        // qjs - QuickJS CLI
+        const qjs_exe_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        });
+        qjs_exe_mod.addIncludePath(b.path("."));
+
+        const qjs_exe = b.addExecutable(.{
+            .name = "qjs",
+            .root_module = qjs_exe_mod,
+        });
+
+        const qjs_exe_sources = [_][]const u8{
+            "gen/repl.c",
+            "gen/standalone.c",
+            "qjs.c",
+        };
+
+        for (&qjs_exe_sources) |src| {
+            qjs_exe.root_module.addCSourceFile(.{
+                .file = b.path(src),
+                .flags = flags_slice,
+            });
+        }
+
+        qjs_exe.linkLibC();
+        qjs_exe.linkLibrary(qjs_lib);
+        addQjsLibc(qjs_libc, qjs_exe);
+        addStatic(qjs_exe, static_cli);
+
+        // Windows stack size
+        if (is_windows) {
+            qjs_exe.linker_allow_shlib_undefined = true;
+        }
+
+        b.installArtifact(qjs_exe);
+
+        // run-test262 - Test262 runner
+        const run_test262_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        });
+        run_test262_mod.addIncludePath(b.path("."));
+
+        const run_test262 = b.addExecutable(.{
+            .name = "run-test262",
+            .root_module = run_test262_mod,
+        });
+        run_test262.root_module.addCSourceFile(.{
+            .file = b.path("run-test262.c"),
+            .flags = flags_slice,
+        });
+        run_test262.linkLibC();
+        run_test262.linkLibrary(qjs_lib);
+        addQjsLibc(qjs_libc, run_test262);
+        b.installArtifact(run_test262);
+
+        // api-test - API test
+        const api_test_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        });
+        api_test_mod.addIncludePath(b.path("."));
+
+        const api_test = b.addExecutable(.{
+            .name = "api-test",
+            .root_module = api_test_mod,
+        });
+        api_test.root_module.addCSourceFile(.{
+            .file = b.path("api-test.c"),
+            .flags = flags_slice,
+        });
+        api_test.linkLibC();
+        api_test.linkLibrary(qjs_lib);
+        b.installArtifact(api_test);
+
+        // unicode_gen - Unicode generator
+        const unicode_gen_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        });
+        unicode_gen_mod.addIncludePath(b.path("."));
+
+        const unicode_gen = b.addExecutable(.{
+            .name = "unicode_gen",
+            .root_module = unicode_gen_mod,
+        });
+        unicode_gen.root_module.addCSourceFile(.{
+            .file = b.path("libunicode.c"),
+            .flags = flags_slice,
+        });
+        unicode_gen.root_module.addCSourceFile(.{
+            .file = b.path("unicode_gen.c"),
+            .flags = flags_slice,
+        });
+        unicode_gen.linkLibC();
+        b.installArtifact(unicode_gen);
+
+        // function_source - Generated test executable
+        const function_source_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        });
+        function_source_mod.addIncludePath(b.path("."));
+
+        const function_source = b.addExecutable(.{
+            .name = "function_source",
+            .root_module = function_source_mod,
+        });
+        function_source.root_module.addCSourceFile(.{
+            .file = b.path("gen/function_source.c"),
+            .flags = flags_slice,
+        });
+        function_source.linkLibC();
+        function_source.linkLibrary(qjs_lib);
+        addQjsLibc(qjs_libc, function_source);
+        b.installArtifact(function_source);
+
+        // Run commands
+        const run_cmd = b.addRunArtifact(qjs_exe);
+        run_cmd.step.dependOn(b.getInstallStep());
+        if (b.args) |args| {
+            run_cmd.addArgs(args);
+        }
+        const run_step = b.step("run", "Run the qjs CLI");
+        run_step.dependOn(&run_cmd.step);
+
+        // Test step
+        const test_step = b.step("test", "Run tests");
+        const run_tests = b.addRunArtifact(api_test);
+        test_step.dependOn(&run_tests.step);
     }
-
-    qjs_exe.linkLibC();
-    qjs_exe.linkLibrary(qjs_lib);
-    addQjsLibc(qjs_libc, qjs_exe);
-    addStatic(qjs_exe, static_cli);
-
-    // Windows stack size
-    if (is_windows) {
-        qjs_exe.linker_allow_shlib_undefined = true;
-    }
-
-    b.installArtifact(qjs_exe);
-
-    // run-test262 - Test262 runner
-    const run_test262_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-    });
-    run_test262_mod.addIncludePath(b.path("."));
-
-    const run_test262 = b.addExecutable(.{
-        .name = "run-test262",
-        .root_module = run_test262_mod,
-    });
-    run_test262.root_module.addCSourceFile(.{
-        .file = b.path("run-test262.c"),
-        .flags = flags_slice,
-    });
-    run_test262.linkLibC();
-    run_test262.linkLibrary(qjs_lib);
-    addQjsLibc(qjs_libc, run_test262);
-    b.installArtifact(run_test262);
-
-    // api-test - API test
-    const api_test_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-    });
-    api_test_mod.addIncludePath(b.path("."));
-
-    const api_test = b.addExecutable(.{
-        .name = "api-test",
-        .root_module = api_test_mod,
-    });
-    api_test.root_module.addCSourceFile(.{
-        .file = b.path("api-test.c"),
-        .flags = flags_slice,
-    });
-    api_test.linkLibC();
-    api_test.linkLibrary(qjs_lib);
-    b.installArtifact(api_test);
-
-    // unicode_gen - Unicode generator
-    const unicode_gen_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-    });
-    unicode_gen_mod.addIncludePath(b.path("."));
-
-    const unicode_gen = b.addExecutable(.{
-        .name = "unicode_gen",
-        .root_module = unicode_gen_mod,
-    });
-    unicode_gen.root_module.addCSourceFile(.{
-        .file = b.path("libunicode.c"),
-        .flags = flags_slice,
-    });
-    unicode_gen.root_module.addCSourceFile(.{
-        .file = b.path("unicode_gen.c"),
-        .flags = flags_slice,
-    });
-    unicode_gen.linkLibC();
-    b.installArtifact(unicode_gen);
-
-    // function_source - Generated test executable
-    const function_source_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-    });
-    function_source_mod.addIncludePath(b.path("."));
-
-    const function_source = b.addExecutable(.{
-        .name = "function_source",
-        .root_module = function_source_mod,
-    });
-    function_source.root_module.addCSourceFile(.{
-        .file = b.path("gen/function_source.c"),
-        .flags = flags_slice,
-    });
-    function_source.linkLibC();
-    function_source.linkLibrary(qjs_lib);
-    addQjsLibc(qjs_libc, function_source);
-    b.installArtifact(function_source);
 
     // Examples
-    if (build_examples) {
+    if (!is_wasi and build_examples) {
         // hello
         const hello_mod = b.createModule(.{
             .target = target,
@@ -456,6 +490,8 @@ pub fn build(b: *std.Build) !void {
                 .root_module = qjs_wasi_mod,
             });
             const wasi_sources = [_][]const u8{
+                "gen/repl.c",
+                "gen/standalone.c",
                 "quickjs-libc.c",
                 "qjs-wasi-reactor.c",
             };
@@ -466,24 +502,14 @@ pub fn build(b: *std.Build) !void {
                 });
             }
             qjs_wasi.linkLibC();
+            qjs_wasi.linkSystemLibrary("wasi-emulated-signal");
+            qjs_wasi.linkSystemLibrary("wasi-emulated-process-clocks");
             qjs_wasi.linkLibrary(qjs_lib);
+            qjs_wasi.linker_allow_shlib_undefined = true;
+            qjs_wasi.export_table = true;
             b.installArtifact(qjs_wasi);
         }
     }
-
-    // Run commands
-    const run_cmd = b.addRunArtifact(qjs_exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
-    const run_step = b.step("run", "Run the qjs CLI");
-    run_step.dependOn(&run_cmd.step);
-
-    // Test step
-    const test_step = b.step("test", "Run tests");
-    const run_tests = b.addRunArtifact(api_test);
-    test_step.dependOn(&run_tests.step);
 
     // Print configuration
     std.debug.print("\nQuickJS-ng Zig Build Configuration:\n", .{});
