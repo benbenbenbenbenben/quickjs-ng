@@ -508,6 +508,43 @@ pub fn build(b: *std.Build) !void {
             qjs_wasi.linker_allow_shlib_undefined = true;
             qjs_wasi.export_table = true;
             b.installArtifact(qjs_wasi);
+
+            // Generate and install qjs-wasi-reactor.h header
+            const wasi_header = b.addWriteFiles();
+            _ = wasi_header.add("qjs-wasi-reactor.h",
+                \\#ifndef QJS_WASI_REACTOR_H
+                \\#define QJS_WASI_REACTOR_H
+                \\
+                \\#include <stdint.h>
+                \\#include "quickjs.h"
+                \\
+                \\#ifdef __cplusplus
+                \\extern "C" {
+                \\#endif
+                \\
+                \\/* Initialize QuickJS reactor with default arguments */
+                \\int qjs_init(void);
+                \\
+                \\/* Initialize QuickJS reactor with custom arguments */
+                \\int qjs_init_argv(int argc, char **argv);
+                \\
+                \\/* Get the current QuickJS context */
+                \\JSContext *qjs_get_context(void);
+                \\
+                \\/* Destroy the QuickJS reactor and clean up resources */
+                \\void qjs_destroy(void);
+                \\
+                \\#ifdef __cplusplus
+                \\}
+                \\#endif
+                \\
+                \\#endif /* QJS_WASI_REACTOR_H */
+            );
+            b.installDirectory(.{
+                .source_dir = wasi_header.getDirectory(),
+                .install_dir = .bin,
+                .install_subdir = "",
+            });
         }
     }
 
