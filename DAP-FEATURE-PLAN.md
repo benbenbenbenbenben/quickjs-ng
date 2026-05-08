@@ -9,7 +9,7 @@ VS Code and other DAP-compliant clients to attach and debug JavaScript
 execution with breakpoints, stepping, variable inspection, and stack traces.
 
 The DAP implementation will be written in **pure C** (no C++ dependency) to
-match the rest of the codebase. A minimal JSON reader/writer and the DAP
+match the rest of the codebase. A small, bounded JSON reader/writer and the DAP
 message framing will be implemented directly. This avoids introducing cppdap
 as a dependency (C++11, nlohmann/json) that would be at odds with the C11
 codebase and its C-only build targets (WASI, Emscripten).
@@ -55,20 +55,22 @@ Selected via CLI flags: `--dap` (stdio) or `--dap=tcp:PORT` (TCP).
 |------|---------|
 | `qjs-dap.h` | Public DAP debug API (types, functions) |
 | `qjs-dap.c` | DAP server: transport, protocol, session management |
-| `qjs-debug.h` | Internal debug instrumentation API |
-| `qjs-debug.c` | Debug hooks: breakpoints, stepping, variable inspection |
+| `qjs-debug.h` | Internal debug instrumentation API shared by `quickjs.c` and the DAP server |
+| `qjs-debug.c` | Debug controller helpers: breakpoints, stepping state, pause/resume |
 | `tests/test_dap.py` | Integration tests (Python script using DAP client) |
 
 ### Modified Source Files
 
 | File | Changes |
 |------|---------|
-| `quickjs.c` | New `OP_debugger` opcode handling; expose `find_line_num` and `JSStackFrame` accessors; conditional per-opcode callback |
+| `quickjs.c` | New `OP_debugger` opcode handling; debug poll hook; stack/local inspection APIs that need private VM structs |
 | `quickjs.h` | New public APIs: `JS_SetDebugHandler`, `JS_GetStackFrames`, `JS_GetLocalVariables`, `JS_EvaluateAtFrame` |
 | `qjs.c` | New `--dap` / `--dap=tcp:PORT` CLI flags; DAP server lifecycle |
 | `CMakeLists.txt` | `QJS_ENABLE_DAP` option; conditional source inclusion |
+| `Makefile` | Forward `QJS_ENABLE_DAP` into CMake configuration |
 | `build.zig` | `dap` option; conditional source inclusion |
 | `meson.build` | `dap` option; conditional source inclusion |
+| `meson_options.txt` | `dap` option |
 | `.github/workflows/ci.yml` | New DAP test CI job |
 
 ---
@@ -120,11 +122,12 @@ When enabled, this callback is invoked before each opcode executes.
 **New `JSDebugHandler` callback type** (in `quickjs.h`):
 ```c
 typedef enum {
-    JS_DEBUG_REASON_BREAKPOINT = 1,
-    JS_DEBUG_REASON_STEP = 2,
-    JS_DEBUG_REASON_DEBUGGER_STMT = 3,
-    JS_DEBUG_REASON_EXCEPTION = 4,
-    JS_DEBUG_REASON_ENTRY = 5,
+    JS_DEBUG_REASON_POLL = 1,
+    JS_DEBUG_REASON_BREAKPOINT = 2,
+    JS_DEBUG_REASON_STEP = 3,
+    JS_DEBUG_REASON_DEBUGGER_STMT = 4,
+    JS_DEBUG_REASON_EXCEPTION = 5,
+    JS_DEBUG_REASON_ENTRY = 6,
 } JSDebugReason;
 
 typedef int JSDebugHandler(JSRuntime *rt, void *opaque,
@@ -138,16 +141,17 @@ void JS_SetDebugHandler(JSRuntime *rt, JSDebugHandler *cb, void *opaque);
 loop, add (guarded by a runtime flag `rt->debug_enabled`):
 
 ```c
-if (__builtin_expect(rt->debug_enabled, 0)) {
+if (unlikely(rt->debug_enabled)) {
     int ret = rt->debug_handler(rt, rt->debug_opaque,
-                                JS_DEBUG_REASON_STEP, pc - 1);
+                                JS_DEBUG_REASON_POLL, pc - 1);
     if (ret)
         goto exception;
 }
 ```
 
-The `__builtin_expect` ensures zero overhead when debugging is disabled.
-The flag `rt->debug_enabled` is a new `uint8_t` field in `JSRuntime`.
+Use the existing `unlikely()` macro instead of spelling `__builtin_expect`
+directly so MSVC and other non-GNU-like compilers keep working. The flag
+`rt->debug_enabled` is a new `uint8_t` field in `JSRuntime`.
 
 ### 1.3 Breakpoint Management
 
@@ -182,12 +186,16 @@ typedef struct JSDebugState {
 } JSDebugState;
 ```
 
-When the per-opcode callback fires, it:
+When the per-opcode poll callback fires, it:
 1. Gets the current source location via `find_line_num()`.
 2. Checks if `(filename, line)` matches a breakpoint.
 3. Checks step conditions (depth change for step-in/out, same-frame for step-over).
 4. If a match, enters the **paused** state and blocks waiting for a DAP
    continue/step command.
+
+To limit debug-mode overhead, cache the last `(function, pc, line)` checked
+and only run breakpoint lookup when the source line changes or when step/async
+pause state requires instruction-level checks.
 
 ### 1.4 Variable Inspection API
 
@@ -224,9 +232,11 @@ JSValue JS_EvaluateAtFrame(JSContext *ctx, int frame_index,
 int JS_GetGlobalVariables(JSContext *ctx, JSVarInfo **vars);
 ```
 
-These are implemented by walking `rt->current_stack_frame` and reading
-`sf->arg_buf[]`, `sf->var_buf[]` using the `JSFunctionBytecode.vardefs`
-metadata.
+These accessors are implemented inside `quickjs.c`, not in `qjs-debug.c`,
+because `JSStackFrame`, `JSFunctionBytecode`, `arg_buf`, `var_buf`, and
+`vardefs` are private VM internals. Public functions should return duplicated
+`JSValue`/`JSAtom` data with clear ownership rules so callers can free them
+without depending on private structs.
 
 ### 1.5 Expose `find_line_num` Internally
 
@@ -257,10 +267,12 @@ the handler every ~10000 opcodes. The debug system will use this for:
 
 ### 2.1 JSON Layer (`qjs-dap.c` internal)
 
-A minimal JSON serializer/deserializer for DAP messages. This does **not**
+A small JSON serializer/deserializer for DAP messages. This does **not**
 need to be a general-purpose JSON library — it only needs to handle:
 
-- Parsing DAP request objects (flat + one level of nesting)
+- Parsing DAP request objects with bounded recursion for nested objects/arrays
+  used by DAP payloads such as `setBreakpoints`, `stackTrace`, `scopes`, and
+  `variables`
 - Constructing DAP response and event objects
 - No streaming parser needed; full messages fit in memory
 
@@ -283,7 +295,9 @@ Implement read/write functions for this framing over both stdio and TCP.
 **Stdio transport:**
 - Read DAP frames from stdin, write to stdout
 - Binary-safe using `Content-Length` framing
-- `qjs` redirects its own JS stdout/stderr to DAP `output` events
+- While DAP stdio is active, stdout is reserved exclusively for protocol
+  frames; `qjs` redirects JS stdout/stderr to DAP `output` events or to the
+  optional `--dap-log` file for adapter diagnostics
 
 **TCP transport:**
 - Listen on specified port
@@ -344,11 +358,13 @@ typedef struct DAPTransport {
 | `stackTrace` | Return call stack frames |
 | `scopes` | Return scopes for a frame (locals, globals, closure) |
 | `variables` | Return variables in a scope |
+| `setVariable` | Modify a local/global variable when the target is paused |
 | `continue` | Resume execution |
 | `next` | Step over (next line in same frame) |
 | `stepIn` | Step into function call |
 | `stepOut` | Step out of current function |
 | `evaluate` | Evaluate expression in frame context |
+| `exceptionInfo` | Return details for the current exception stop |
 | `disconnect` | End session |
 | `terminate` | Terminate debuggee |
 
@@ -375,7 +391,7 @@ typedef struct DAPTransport {
   "supportsHitConditionalBreakpoints": false,
   "supportsExceptionInfoRequest": true,
   "supportsTerminateRequest": true,
-  "supportsCancelRequest": true
+  "supportsCancelRequest": false
 }
 ```
 
@@ -384,8 +400,9 @@ typedef struct DAPTransport {
 When the debug handler detects a breakpoint or step completion, it needs
 to **block** the JS interpreter and wait for a DAP command.
 
-Implementation: Use a mutex + condition variable (or a simple socket poll
-loop since the DAP server is single-threaded).
+Implementation: Use a simple DAP message loop while paused. Avoid mutexes and
+condition variables in the MVP because the DAP server and interpreter run on
+the same thread.
 
 ```
 JS thread (same thread as DAP server):
@@ -443,21 +460,39 @@ When DAP is active, redirect JS `console.log` / `print` output to DAP
 
 ## Phase 4: Build System Integration
 
-### 4.1 CMake (`CMakeLists.txt`)
+### 4.1 CMake and Make wrapper (`CMakeLists.txt`, `Makefile`)
 
 ```cmake
 xoption(QJS_ENABLE_DAP "Enable DAP debugging support" OFF)
 
 if(QJS_ENABLE_DAP)
-    set(qjs_sources ${qjs_sources} qjs-dap.c qjs-debug.c)
+    list(APPEND qjs_sources qjs-debug.c)
 endif()
+
+# After add_executable(qjs_exe ...)
+if(QJS_ENABLE_DAP)
+    target_sources(qjs_exe PRIVATE qjs-dap.c)
+endif()
+```
+
+The top-level `Makefile` is a CMake wrapper, so pass the flag during configure:
+
+```make
+QJS_ENABLE_DAP?=OFF
+
+$(BUILD_DIR):
+	cmake -B $(BUILD_DIR) \
+		-DCMAKE_BUILD_TYPE=$(BUILD_TYPE) \
+		-DCMAKE_INSTALL_PREFIX=$(INSTALL_PREFIX) \
+		-DQJS_ENABLE_DAP=$(QJS_ENABLE_DAP)
 ```
 
 ### 4.2 Zig (`build.zig`)
 
 ```zig
 const build_dap = b.option(bool, "dap", "Enable DAP debugging") orelse false;
-// ... conditionally add qjs-dap.c and qjs-debug.c to sources
+// ... add -DQJS_ENABLE_DAP and conditionally add qjs-debug.c to the library
+// ... conditionally add qjs-dap.c to the qjs executable
 ```
 
 ### 4.3 Meson (`meson.build`, `meson_options.txt`)
@@ -465,6 +500,9 @@ const build_dap = b.option(bool, "dap", "Enable DAP debugging") orelse false;
 ```meson
 option('dap', type: 'boolean', value: false, description: 'Enable DAP debugging')
 ```
+
+When enabled, add `-DQJS_ENABLE_DAP`, include `qjs-debug.c` in `qjs_srcs`, and
+include `qjs-dap.c` in `qjs_exe_srcs`.
 
 ### 4.4 Conditional Compilation
 
@@ -615,7 +653,9 @@ instrumentation API).
 1. **Build system consistency**: QuickJS builds with four build systems, all
    targeting pure C. Adding a C++ dependency would require all four to handle
    C++ compilation, linking, and the nlohmann/json transitive dependency.
-2. **WASI/Emscripten support**: These targets have limited C++ support.
+2. **WASI/Emscripten support**: These targets have limited C++ and socket
+   support. The DAP flag should compile everywhere, with TCP transport gated
+   out or reported unsupported where sockets are unavailable.
 3. **Minimal scope**: DAP uses a simple JSON-RPC framing over a single
    transport. A full SDK is overkill; ~700 lines of JSON handling suffices.
 4. **No external dependencies**: QuickJS has zero runtime dependencies today.
@@ -624,8 +664,8 @@ instrumentation API).
 ### Why per-opcode callback instead of only interrupt handler?
 
 The interrupt handler fires every ~10000 opcodes. For responsive stepping
-and breakpoints, we need to check every opcode. The `__builtin_expect`
-branch hint ensures the hot path is unaffected when debugging is off.
+and breakpoints, we need a cheap poll point at every opcode. The existing
+`unlikely()` branch hint keeps the hot path predictable when debugging is off.
 
 ### Why single-threaded?
 
