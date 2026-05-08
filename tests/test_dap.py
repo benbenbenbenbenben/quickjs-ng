@@ -10,6 +10,9 @@ import time
 import unittest
 from collections import deque
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+EXAMPLE_WORKSPACE_DEMO = REPO_ROOT / "tools/vscode-qjs-dap" / "example-workspace" / "demo.js"
+
 
 def find_free_port():
     with socket.socket() as sock:
@@ -207,6 +210,12 @@ class DAPIntegrationTests(unittest.TestCase):
         response = client.expect_response(seq, "variables")
         return {entry["name"]: entry["value"] for entry in response["body"]["variables"]}
 
+    def find_line(self, source, snippet):
+        for index, line in enumerate(source.splitlines(), start=1):
+            if snippet in line:
+                return index
+        self.fail(f"missing snippet in source: {snippet!r}")
+
     def test_launch_stop_on_entry_and_output(self):
         client = self.make_client(
             """
@@ -396,10 +405,19 @@ class DAPIntegrationTests(unittest.TestCase):
         client.wait_for_event("continued")
         stopped = client.wait_for_event("stopped")
         self.assertEqual(stopped["body"]["reason"], "step")
-        self.assertEqual(pathlib.Path(self.get_top_frame(client)["source"]["path"]).resolve(), client.script_path.resolve())
+        frame = self.get_top_frame(client)
+        self.assertEqual(frame["name"], "inner")
+        self.assertEqual(pathlib.Path(frame["source"]["path"]).resolve(), client.script_path.resolve())
 
         seq = client.send_request("stepOut", {"threadId": 1})
         client.expect_response(seq, "stepOut")
+        client.wait_for_event("continued")
+        stopped = client.wait_for_event("stopped")
+        self.assertEqual(stopped["body"]["reason"], "step")
+        self.assertEqual(self.get_top_frame(client)["name"], "outer")
+
+        seq = client.send_request("continue", {"threadId": 1})
+        client.expect_response(seq, "continue")
         client.wait_for_event("continued")
         output = client.wait_for_event("output", predicate=lambda msg: "3" in msg["body"]["output"])
         self.assertIn("3", output["body"]["output"])
@@ -475,6 +493,70 @@ class DAPIntegrationTests(unittest.TestCase):
         client.wait_for_event("continued")
         output = client.wait_for_event("output", predicate=lambda msg: "41" in msg["body"]["output"])
         self.assertIn("41", output["body"]["output"])
+        client.wait_for_event("exited")
+        client.wait_for_event("terminated")
+
+    def test_example_workspace_demo_steps_into_closure(self):
+        demo_source = EXAMPLE_WORKSPACE_DEMO.read_text()
+        debugger_line = self.find_line(demo_source, "debugger;")
+        call_line = self.find_line(demo_source, "const count = increment(2);")
+
+        client = self.make_client(demo_source)
+        client.initialize()
+        client.launch()
+        seq = client.send_request(
+            "setBreakpoints",
+            {
+                "source": {"path": str(client.script_path)},
+                "breakpoints": [{"line": call_line}],
+            },
+        )
+        client.expect_response(seq, "setBreakpoints")
+        client.configuration_done()
+
+        stopped = client.wait_for_event("stopped")
+        self.assertEqual(stopped["body"]["reason"], "debugger_statement")
+        self.assertEqual(self.get_top_frame(client)["line"], debugger_line)
+
+        seq = client.send_request("continue", {"threadId": 1})
+        client.expect_response(seq, "continue")
+        client.wait_for_event("continued")
+        stopped = client.wait_for_event("stopped")
+        self.assertEqual(stopped["body"]["reason"], "breakpoint")
+
+        frame = self.get_top_frame(client)
+        self.assertEqual(frame["name"], "main")
+        self.assertEqual(frame["line"], call_line)
+
+        seq = client.send_request("stepIn", {"threadId": 1})
+        client.expect_response(seq, "stepIn")
+        client.wait_for_event("continued")
+        stopped = client.wait_for_event("stopped")
+        self.assertEqual(stopped["body"]["reason"], "step")
+
+        frame = self.get_top_frame(client)
+        self.assertEqual(frame["name"], "increment")
+
+        scope_refs = self.get_scope_refs(client, frame["id"])
+        self.assertIn("Closure", scope_refs)
+        self.assertEqual(self.get_variables(client, scope_refs["Locals"])["step"], "2")
+        self.assertEqual(self.get_variables(client, scope_refs["Closure"])["count"], "1")
+
+        seq = client.send_request("stepOut", {"threadId": 1})
+        client.expect_response(seq, "stepOut")
+        client.wait_for_event("continued")
+        stopped = client.wait_for_event("stopped")
+        self.assertEqual(stopped["body"]["reason"], "step")
+
+        frame = self.get_top_frame(client)
+        self.assertEqual(frame["name"], "main")
+        self.assertEqual(frame["line"], call_line)
+
+        seq = client.send_request("continue", {"threadId": 1})
+        client.expect_response(seq, "continue")
+        client.wait_for_event("continued")
+        output = client.wait_for_event("output", predicate=lambda msg: "3" in msg["body"]["output"])
+        self.assertIn("3", output["body"]["output"])
         client.wait_for_event("exited")
         client.wait_for_event("terminated")
 

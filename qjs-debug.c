@@ -2,6 +2,23 @@
 #include <string.h>
 #include <stdlib.h>
 
+static int js_debug_get_top_frame_line(JSContext *ctx, int *line)
+{
+    JSStackFrameInfo *frames = NULL;
+    int num_frames = JS_GetStackTrace(ctx, &frames, 1);
+    if (num_frames <= 0)
+        return -1;
+
+    *line = frames[0].line;
+    JS_FreeValue(ctx, frames[0].func);
+    if (frames[0].filename != JS_ATOM_NULL)
+        JS_FreeAtom(ctx, frames[0].filename);
+    if (frames[0].func_name != JS_ATOM_NULL)
+        JS_FreeAtom(ctx, frames[0].func_name);
+    js_free(ctx, frames);
+    return 0;
+}
+
 static void js_debug_clear_stop_state(JSDebugState *ds)
 {
     if (JS_IsException(ds->stop_exception) || JS_IsUninitialized(ds->stop_exception))
@@ -155,9 +172,11 @@ int js_debug_handler(JSRuntime *rt, void *opaque, JSDebugReason reason, const ui
 
     if (reason == JS_DEBUG_REASON_DEBUGGER) {
         should_pause = true;
+        js_debug_get_top_frame_line(ctx, &ds->last_line);
     } else if (reason == JS_DEBUG_REASON_EXCEPTION) {
         if (ds->pause_on_exceptions) {
             should_pause = true;
+            js_debug_get_top_frame_line(ctx, &ds->last_line);
         }
     } else if (reason == JS_DEBUG_REASON_POLL || reason == JS_DEBUG_REASON_STEP) {
         // To get the line number, we need the current frame's function.

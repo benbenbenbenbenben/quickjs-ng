@@ -17548,6 +17548,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #ifdef QJS_ENABLE_DAP
 #define DEBUG_POLL(pc) \
     if (unlikely(ctx->rt->debug_enabled)) { \
+        sf->cur_pc = (pc); \
         int ret = ctx->rt->debug_handler(ctx->rt, ctx->rt->debug_opaque, \
                                     JS_DEBUG_REASON_POLL, pc); \
         if (ret) goto exception; \
@@ -20187,6 +20188,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_debugger):
 #ifdef QJS_ENABLE_DAP
             if (unlikely(ctx->rt->debug_enabled)) {
+                sf->cur_pc = pc;
                 int ret = ctx->rt->debug_handler(ctx->rt, ctx->rt->debug_opaque,
                                             JS_DEBUG_REASON_DEBUGGER, pc - 1);
                 if (ret)
@@ -28005,6 +28007,7 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
     JSAtom name = JS_ATOM_NULL;
 
     for (;;) {
+        emit_source_loc(s);
         if (s->token.val == TOK_IDENT) {
             if (s->token.u.ident.is_reserved) {
                 return js_parse_error_reserved_identifier(s);
@@ -29094,6 +29097,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         break;
 
     case TOK_DEBUGGER:
+        emit_source_loc(s);
         emit_op(s, OP_debugger);
         if (next_token(s))
             goto fail;
@@ -62064,7 +62068,13 @@ int JS_GetStackTrace(JSContext *ctx, JSStackFrameInfo **frames, int max_frames)
                         info->func_name = JS_DupAtom(ctx, b->func_name);
                         
                     if (curr->cur_pc) {
-                        info->line = find_line_num(ctx, b, curr->cur_pc - b->byte_code_buf - 1, &info->col);
+                        ptrdiff_t pc = curr->cur_pc - b->byte_code_buf;
+                        if (pc > 0) {
+                            info->line = find_line_num(ctx, b, pc - 1, &info->col);
+                        } else {
+                            info->line = b->line_num;
+                            info->col = 1;
+                        }
                     } else {
                         info->line = b->line_num;
                     }
