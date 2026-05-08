@@ -1186,9 +1186,11 @@ typedef struct JSVarInfo {
 } JSVarInfo;
 
 JS_EXTERN int JS_GetFrameLocals(JSContext *ctx, int frame_index, JSVarInfo **vars);
+JS_EXTERN int JS_GetFrameClosures(JSContext *ctx, int frame_index, JSVarInfo **vars);
 JS_EXTERN JSValue JS_EvaluateAtFrame(JSContext *ctx, int frame_index, const char *expr, size_t expr_len);
 JS_EXTERN int JS_GetGlobalVariables(JSContext *ctx, JSVarInfo **vars);
 JS_EXTERN int JS_SetFrameLocal(JSContext *ctx, int frame_index, const char *name, JSValueConst value);
+JS_EXTERN int JS_SetFrameClosure(JSContext *ctx, int frame_index, const char *name, JSValueConst value);
 JS_EXTERN int JS_SetGlobalVariable(JSContext *ctx, const char *name, JSValueConst value);
 JS_EXTERN int JS_GetPCLineNumber(JSContext *ctx, JSValueConst func, uint32_t pc);
 

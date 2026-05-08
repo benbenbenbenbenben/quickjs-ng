@@ -62095,24 +62095,45 @@ int JS_GetStackDepth(JSContext *ctx)
     return count;
 }
 
-int JS_GetFrameLocals(JSContext *ctx, int frame_index, JSVarInfo **vars)
+static int js_resolve_frame_bytecode(JSContext *ctx, int frame_index,
+                                     JSStackFrame **psf,
+                                     JSFunctionBytecode **pb)
 {
     JSStackFrame *sf = ctx->rt->current_stack_frame;
     int curr_idx = 0;
+
     while (sf != NULL && curr_idx < frame_index) {
         sf = sf->prev_frame;
         curr_idx++;
     }
-    if (!sf) return -1;
-
-    *vars = NULL;
+    if (!sf)
+        return -1;
+    if (psf)
+        *psf = sf;
     if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
         return 0;
     JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
     if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
         return 0;
-    JSFunctionBytecode *b = p->u.func.function_bytecode;
-    if (!b) return 0;
+    if (!p->u.func.function_bytecode)
+        return 0;
+    if (pb)
+        *pb = p->u.func.function_bytecode;
+    return 1;
+}
+
+int JS_GetFrameLocals(JSContext *ctx, int frame_index, JSVarInfo **vars)
+{
+    JSStackFrame *sf;
+    JSFunctionBytecode *b;
+    int resolved;
+
+    *vars = NULL;
+    resolved = js_resolve_frame_bytecode(ctx, frame_index, &sf, &b);
+    if (resolved < 0)
+        return -1;
+    if (resolved == 0)
+        return 0;
 
     int total_vars = b->arg_count + b->var_count;
     if (total_vars == 0) return 0;
@@ -62132,6 +62153,53 @@ int JS_GetFrameLocals(JSContext *ctx, int frame_index, JSVarInfo **vars)
         vi->frame_index = frame_index;
     }
     return total_vars;
+}
+
+int JS_GetFrameClosures(JSContext *ctx, int frame_index, JSVarInfo **vars)
+{
+    JSStackFrame *sf;
+    JSFunctionBytecode *b;
+    JSVarRef **var_refs;
+    int resolved;
+    int count;
+    int i;
+
+    *vars = NULL;
+    resolved = js_resolve_frame_bytecode(ctx, frame_index, &sf, &b);
+    if (resolved < 0)
+        return -1;
+    if (resolved == 0 || b->closure_var_count == 0)
+        return 0;
+
+    var_refs = JS_VALUE_GET_OBJ(sf->cur_func)->u.func.var_refs;
+    if (!var_refs)
+        return 0;
+
+    count = 0;
+    for (i = 0; i < b->closure_var_count; i++) {
+        if (var_refs[i])
+            count++;
+    }
+    if (count == 0)
+        return 0;
+
+    *vars = js_mallocz(ctx, count * sizeof(JSVarInfo));
+    if (!*vars)
+        return -1;
+
+    count = 0;
+    for (i = 0; i < b->closure_var_count; i++) {
+        JSVarRef *var_ref = var_refs[i];
+        JSVarInfo *vi;
+
+        if (!var_ref)
+            continue;
+        vi = &(*vars)[count++];
+        vi->name = JS_DupAtom(ctx, b->closure_var[i].var_name);
+        vi->value = JS_DupValue(ctx, *var_ref->pvalue);
+        vi->frame_index = frame_index;
+    }
+    return count;
 }
 
 static bool js_is_simple_identifier(const char *name)
@@ -62168,27 +62236,45 @@ static void js_free_var_info_array(JSContext *ctx, JSVarInfo *vars, int count)
 
 JSValue JS_EvaluateAtFrame(JSContext *ctx, int frame_index, const char *expr, size_t expr_len)
 {
-    JSVarInfo *vars = NULL;
+    JSVarInfo *locals_vars = NULL;
+    JSVarInfo *closure_vars = NULL;
     JSValue func = JS_UNDEFINED;
     JSValue locals = JS_UNDEFINED;
     JSValue ret = JS_EXCEPTION;
-    int count, i;
+    int locals_count, closure_count, total_count, i, index;
     DynBuf dbuf;
 
-    count = JS_GetFrameLocals(ctx, frame_index, &vars);
-    if (count < 0)
+    locals_count = JS_GetFrameLocals(ctx, frame_index, &locals_vars);
+    if (locals_count < 0)
         return JS_ThrowReferenceError(ctx, "invalid frame index");
-    if (count == 0)
+    closure_count = JS_GetFrameClosures(ctx, frame_index, &closure_vars);
+    if (closure_count < 0) {
+        js_free_var_info_array(ctx, locals_vars, locals_count);
+        return JS_ThrowInternalError(ctx, "failed to inspect frame closures");
+    }
+    total_count = locals_count + closure_count;
+    if (total_count == 0)
         return JS_Eval(ctx, expr, expr_len, "<eval>", JS_EVAL_TYPE_GLOBAL);
 
     dbuf_init(&dbuf);
     dbuf_putstr(&dbuf, "(function(__qjs_locals__){");
-    for (i = 0; i < count; i++) {
-        const char *name = JS_AtomToCString(ctx, vars[i].name);
+    index = 0;
+    for (i = 0; i < locals_count; i++, index++) {
+        const char *name = JS_AtomToCString(ctx, locals_vars[i].name);
         if (name && js_is_simple_identifier(name)) {
             dbuf_putstr(&dbuf, "var ");
             dbuf_putstr(&dbuf, name);
-            dbuf_printf(&dbuf, " = __qjs_locals__[%d];", i);
+            dbuf_printf(&dbuf, " = __qjs_locals__[%d];", index);
+        }
+        if (name)
+            JS_FreeCString(ctx, name);
+    }
+    for (i = 0; i < closure_count; i++, index++) {
+        const char *name = JS_AtomToCString(ctx, closure_vars[i].name);
+        if (name && js_is_simple_identifier(name)) {
+            dbuf_putstr(&dbuf, "var ");
+            dbuf_putstr(&dbuf, name);
+            dbuf_printf(&dbuf, " = __qjs_locals__[%d];", index);
         }
         if (name)
             JS_FreeCString(ctx, name);
@@ -62199,25 +62285,32 @@ JSValue JS_EvaluateAtFrame(JSContext *ctx, int frame_index, const char *expr, si
     dbuf_putc(&dbuf, '\0');
     if (dbuf_error(&dbuf)) {
         dbuf_free(&dbuf);
-        js_free_var_info_array(ctx, vars, count);
+        js_free_var_info_array(ctx, locals_vars, locals_count);
+        js_free_var_info_array(ctx, closure_vars, closure_count);
         return JS_EXCEPTION;
     }
 
     func = JS_Eval(ctx, (const char *)dbuf.buf, dbuf.size - 1, "<eval>", JS_EVAL_TYPE_GLOBAL);
     dbuf_free(&dbuf);
     if (JS_IsException(func)) {
-        js_free_var_info_array(ctx, vars, count);
+        js_free_var_info_array(ctx, locals_vars, locals_count);
+        js_free_var_info_array(ctx, closure_vars, closure_count);
         return func;
     }
 
     locals = JS_NewArray(ctx);
-    for (i = 0; i < count; i++) {
-        JS_SetPropertyUint32(ctx, locals, i, JS_DupValue(ctx, vars[i].value));
+    index = 0;
+    for (i = 0; i < locals_count; i++, index++) {
+        JS_SetPropertyUint32(ctx, locals, index, JS_DupValue(ctx, locals_vars[i].value));
+    }
+    for (i = 0; i < closure_count; i++, index++) {
+        JS_SetPropertyUint32(ctx, locals, index, JS_DupValue(ctx, closure_vars[i].value));
     }
     ret = JS_Call(ctx, func, JS_UNDEFINED, 1, (JSValueConst *)&locals);
     JS_FreeValue(ctx, locals);
     JS_FreeValue(ctx, func);
-    js_free_var_info_array(ctx, vars, count);
+    js_free_var_info_array(ctx, locals_vars, locals_count);
+    js_free_var_info_array(ctx, closure_vars, closure_count);
     return ret;
 }
 
@@ -62250,23 +62343,15 @@ int JS_GetGlobalVariables(JSContext *ctx, JSVarInfo **vars)
 
 int JS_SetFrameLocal(JSContext *ctx, int frame_index, const char *name, JSValueConst value)
 {
-    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    JSStackFrame *sf;
+    JSFunctionBytecode *b;
     JSAtom name_atom;
-    int curr_idx = 0;
+    int resolved;
 
-    while (sf != NULL && curr_idx < frame_index) {
-        sf = sf->prev_frame;
-        curr_idx++;
-    }
-    if (!sf || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+    resolved = js_resolve_frame_bytecode(ctx, frame_index, &sf, &b);
+    if (resolved <= 0)
         return -1;
-
-    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
-    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
-        return -1;
-
-    JSFunctionBytecode *b = p->u.func.function_bytecode;
-    if (!b || !b->vardefs)
+    if (!b->vardefs)
         return -1;
 
     name_atom = JS_NewAtom(ctx, name);
@@ -62282,6 +62367,45 @@ int JS_SetFrameLocal(JSContext *ctx, int frame_index, const char *name, JSValueC
         } else {
             set_value(ctx, &sf->var_buf[i - b->arg_count], JS_DupValue(ctx, value));
         }
+        JS_FreeAtom(ctx, name_atom);
+        return 0;
+    }
+
+    JS_FreeAtom(ctx, name_atom);
+    return -1;
+}
+
+int JS_SetFrameClosure(JSContext *ctx, int frame_index, const char *name, JSValueConst value)
+{
+    JSStackFrame *sf;
+    JSFunctionBytecode *b;
+    JSVarRef **var_refs;
+    JSAtom name_atom;
+    int resolved;
+    int i;
+
+    resolved = js_resolve_frame_bytecode(ctx, frame_index, &sf, &b);
+    if (resolved <= 0 || b->closure_var_count == 0)
+        return -1;
+
+    var_refs = JS_VALUE_GET_OBJ(sf->cur_func)->u.func.var_refs;
+    if (!var_refs)
+        return -1;
+
+    name_atom = JS_NewAtom(ctx, name);
+    if (name_atom == JS_ATOM_NULL)
+        return -1;
+
+    for (i = 0; i < b->closure_var_count; i++) {
+        JSVarRef *var_ref = var_refs[i];
+
+        if (!var_ref || b->closure_var[i].var_name != name_atom)
+            continue;
+        if (JS_IsUninitialized(*var_ref->pvalue)) {
+            JS_FreeAtom(ctx, name_atom);
+            return -1;
+        }
+        set_value(ctx, var_ref->pvalue, JS_DupValue(ctx, value));
         JS_FreeAtom(ctx, name_atom);
         return 0;
     }

@@ -30,31 +30,43 @@ class DAPClient:
         self.seq = 1
         self.queue = deque()
 
+    def connect(self):
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                self.sock = socket.create_connection(("127.0.0.1", self.port), timeout=0.2)
+                self.sock.settimeout(5)
+                self.queue.clear()
+                return
+            except OSError:
+                if self.proc is not None and self.proc.poll() is not None:
+                    raise RuntimeError(f"qjs exited early with status {self.proc.returncode}")
+                time.sleep(0.05)
+        raise RuntimeError("timed out waiting for DAP server")
+
     def start(self):
         self.proc = subprocess.Popen(
             [self.qjs_path, f"--dap=tcp:{self.port}"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            try:
-                self.sock = socket.create_connection(("127.0.0.1", self.port), timeout=0.2)
-                self.sock.settimeout(5)
-                return
-            except OSError:
-                if self.proc.poll() is not None:
-                    raise RuntimeError(f"qjs exited early with status {self.proc.returncode}")
-                time.sleep(0.05)
-        raise RuntimeError("timed out waiting for DAP server")
+        self.connect()
 
-    def close(self):
+    def close_socket(self):
         if self.sock is not None:
             try:
                 self.sock.close()
             except OSError:
                 pass
             self.sock = None
+        self.queue.clear()
+
+    def reconnect(self):
+        self.close_socket()
+        self.connect()
+
+    def close(self):
+        self.close_socket()
         if self.proc is not None:
             try:
                 self.proc.wait(timeout=5)
@@ -154,8 +166,9 @@ class DAPClient:
         seq = self.send_request("configurationDone")
         return self.expect_response(seq, "configurationDone")
 
-    def disconnect(self):
-        seq = self.send_request("disconnect")
+    def disconnect(self, terminate_debuggee=False):
+        arguments = {"terminateDebuggee": terminate_debuggee} if terminate_debuggee else {}
+        seq = self.send_request("disconnect", arguments)
         return self.expect_response(seq, "disconnect")
 
     @staticmethod
@@ -181,6 +194,9 @@ class DAPIntegrationTests(unittest.TestCase):
     def get_scopes(self, client, frame_id):
         seq = client.send_request("scopes", {"frameId": frame_id})
         return client.expect_response(seq, "scopes")["body"]["scopes"]
+
+    def get_scope_refs(self, client, frame_id):
+        return {scope["name"]: scope["variablesReference"] for scope in self.get_scopes(client, frame_id)}
 
     def get_variables(self, client, variables_reference):
         seq = client.send_request("variables", {"variablesReference": variables_reference})
@@ -246,9 +262,9 @@ class DAPIntegrationTests(unittest.TestCase):
         self.assertEqual(stopped["body"]["reason"], "breakpoint")
 
         frame = self.get_top_frame(client)
-        scopes = self.get_scopes(client, frame["id"])
-        locals_ref = scopes[0]["variablesReference"]
-        globals_ref = scopes[1]["variablesReference"]
+        scope_refs = self.get_scope_refs(client, frame["id"])
+        locals_ref = scope_refs["Locals"]
+        globals_ref = scope_refs["Globals"]
 
         locals_before = self.get_variables(client, locals_ref)
         self.assertEqual(locals_before["x"], "1")
@@ -307,8 +323,8 @@ class DAPIntegrationTests(unittest.TestCase):
         self.assertEqual(stopped["body"]["hitBreakpointIds"], [1])
 
         frame = self.get_top_frame(client)
-        scopes = self.get_scopes(client, frame["id"])
-        locals_after = self.get_variables(client, scopes[0]["variablesReference"])
+        scope_refs = self.get_scope_refs(client, frame["id"])
+        locals_after = self.get_variables(client, scope_refs["Locals"])
         self.assertEqual(locals_after["x"], "2")
 
         seq = client.send_request("continue", {"threadId": 1})
@@ -403,6 +419,49 @@ class DAPIntegrationTests(unittest.TestCase):
 
         client.disconnect()
 
+    def test_closure_scope_and_set_variable(self):
+        client = self.make_client(
+            """
+            function outer() {
+                let captured = 40;
+                function inner() {
+                    debugger;
+                    print(captured);
+                }
+                inner();
+            }
+            outer();
+            """
+        )
+        client.initialize()
+        client.launch()
+        client.configuration_done()
+
+        stopped = client.wait_for_event("stopped")
+        self.assertEqual(stopped["body"]["reason"], "debugger_statement")
+
+        frame = self.get_top_frame(client)
+        scope_refs = self.get_scope_refs(client, frame["id"])
+        self.assertIn("Closure", scope_refs)
+
+        closure_vars = self.get_variables(client, scope_refs["Closure"])
+        self.assertEqual(closure_vars["captured"], "40")
+
+        seq = client.send_request(
+            "setVariable",
+            {"variablesReference": scope_refs["Closure"], "name": "captured", "value": "41"},
+        )
+        updated = client.expect_response(seq, "setVariable")
+        self.assertEqual(updated["body"]["value"], "41")
+
+        seq = client.send_request("continue", {"threadId": 1})
+        client.expect_response(seq, "continue")
+        client.wait_for_event("continued")
+        output = client.wait_for_event("output", predicate=lambda msg: "41" in msg["body"]["output"])
+        self.assertIn("41", output["body"]["output"])
+        client.wait_for_event("exited")
+        client.wait_for_event("terminated")
+
     def test_pause_while_running(self):
         client = self.make_client(
             """
@@ -420,6 +479,62 @@ class DAPIntegrationTests(unittest.TestCase):
         seq = client.send_request("pause", {"threadId": 1})
         client.expect_response(seq, "pause")
         stopped = client.wait_for_event("stopped", timeout=10)
+        self.assertEqual(stopped["body"]["reason"], "pause")
+
+        seq = client.send_request("terminate")
+        client.expect_response(seq, "terminate")
+        client.proc.wait(timeout=30)
+
+    def test_disconnect_while_running_keeps_program_alive(self):
+        client = self.make_client("print('placeholder');")
+        done_path = client.script_path.with_name("done.txt")
+        client.script_path.write_text(
+            textwrap.dedent(
+                f"""
+                import * as std from "qjs:std";
+
+                let value = 0;
+                while (value < 5000000) {{
+                    value++;
+                }}
+                for (let i = 0; i < 32; i++) {{
+                    print("after-disconnect", i);
+                }}
+                let file = std.open({json.dumps(str(done_path))}, "w");
+                file.puts("finished\\n");
+                file.close();
+                """
+            ).lstrip()
+        )
+        client.initialize()
+        client.launch(module=True)
+        client.configuration_done()
+
+        client.disconnect()
+        client.close_socket()
+        client.proc.wait(timeout=30)
+        self.assertEqual(client.proc.returncode, 0)
+        self.assertEqual(done_path.read_text(), "finished\n")
+
+    def test_tcp_reconnect_allows_second_session(self):
+        client = self.make_client(
+            """
+            let value = 0;
+            while (value < 500000000) {
+                value++;
+            }
+            """
+        )
+        client.initialize()
+        client.launch()
+        client.configuration_done()
+        client.disconnect()
+        client.reconnect()
+
+        client.initialize()
+        seq = client.send_request("pause", {"threadId": 1})
+        client.expect_response(seq, "pause")
+        stopped = client.wait_for_event("stopped", timeout=20)
         self.assertEqual(stopped["body"]["reason"], "pause")
 
         seq = client.send_request("terminate")

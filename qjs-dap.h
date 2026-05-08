@@ -43,7 +43,7 @@ void DAP_ProcessExited(DAPServer *server, int exit_code);
 /* Creates a stdio transport */
 DAPTransport *DAP_NewStdioTransport(void);
 
-/* Creates a TCP transport (blocks until client connects) */
+/* Creates a TCP transport that listens for sequential client sessions. */
 DAPTransport *DAP_NewTCPTransport(int port);
 
 /* Setup JS output redirection so print/console.log go to DAP */
