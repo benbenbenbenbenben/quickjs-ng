@@ -1,6 +1,15 @@
 const childProcess = require("child_process");
+const fs = require("fs");
 const net = require("net");
 const path = require("path");
+
+function repoRootPath() {
+  return path.resolve(__dirname, "..", "..");
+}
+
+function bundledBuildDirectory() {
+  return path.join(repoRootPath(), "build-shared");
+}
 
 function allocatePort(host = "127.0.0.1") {
   return new Promise((resolve, reject) => {
@@ -19,11 +28,8 @@ function allocatePort(host = "127.0.0.1") {
   });
 }
 
-function defaultRuntimePath(folder) {
-  if (!folder) {
-    return "qjs";
-  }
-  return path.join(folder.uri.fsPath, "build-shared", "qjs");
+function defaultRuntimePath() {
+  return path.join(bundledBuildDirectory(), "qjs");
 }
 
 function normalizeEnv(extraEnv) {
@@ -92,6 +98,63 @@ function waitForServer({ host, port, child, timeoutMs = 5000 }) {
   });
 }
 
+function runCommand(command, args, options, outputChannel) {
+  return new Promise((resolve, reject) => {
+    const child = childProcess.spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env || process.env,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    if (outputChannel) {
+      outputChannel.appendLine(`[quickjs-dap] run: ${command} ${args.join(" ")}`);
+      child.stdout.on("data", (chunk) => outputChannel.append(chunk.toString()));
+      child.stderr.on("data", (chunk) => outputChannel.append(chunk.toString()));
+    }
+
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`${command} failed (code=${code}, signal=${signal})`));
+    });
+  });
+}
+
+async function ensureBundledRuntime(runtimePath, outputChannel) {
+  if (fs.existsSync(runtimePath)) {
+    return runtimePath;
+  }
+
+  const repoRoot = repoRootPath();
+  const buildDir = bundledBuildDirectory();
+  const env = normalizeEnv();
+
+  if (outputChannel) {
+    outputChannel.appendLine(`[quickjs-dap] bundled runtime missing, building ${runtimePath}`);
+  }
+
+  await runCommand(
+    "cmake",
+    ["-S", repoRoot, "-B", buildDir, "-DQJS_ENABLE_DAP=ON", "-DBUILD_SHARED_LIBS=ON"],
+    { cwd: repoRoot, env },
+    outputChannel
+  );
+  await runCommand(
+    "cmake",
+    ["--build", buildDir, "--target", "qjs_exe", "--parallel"],
+    { cwd: repoRoot, env },
+    outputChannel
+  );
+
+  if (!fs.existsSync(runtimePath)) {
+    throw new Error(`QuickJS DAP runtime was built but not found at ${runtimePath}`);
+  }
+  return runtimePath;
+}
+
 function spawnQuickJSProcess({ runtime, runtimeArgs, host, port, cwd, dapLog, env, outputChannel }) {
   const args = [...runtimeArgs, `--dap=tcp:${port}`];
   if (dapLog) {
@@ -135,7 +198,7 @@ class QuickJSDebugConfigurationProvider {
         type: "qjs-dap",
         request: "launch",
         program: "${file}",
-        runtime: folder ? path.join(folder.uri.fsPath, "build-shared", "qjs") : "qjs",
+        runtime: defaultRuntimePath(),
         cwd: folder ? folder.uri.fsPath : "${workspaceFolder}",
         stopOnEntry: true
       },
@@ -179,8 +242,8 @@ class QuickJSDebugConfigurationProvider {
         this.vscode.window.showErrorMessage("QuickJS launch requires a 'program' file.");
         return null;
       }
-      config.runtime = config.runtime || defaultRuntimePath(folder);
-      config.cwd = config.cwd || (folder ? folder.uri.fsPath : path.dirname(config.program));
+      config.runtime = config.runtime || defaultRuntimePath();
+      config.cwd = config.cwd || path.dirname(config.program);
       config.host = config.host || "127.0.0.1";
       config.runtimeArgs = Array.isArray(config.runtimeArgs) ? config.runtimeArgs : [];
       config.args = Array.isArray(config.args) ? config.args : [];
@@ -215,9 +278,10 @@ class QuickJSDebugAdapterDescriptorFactory {
 
     const host = session.configuration.host || "127.0.0.1";
     const port = await allocatePort(host);
-    const runtime = session.configuration.runtime || defaultRuntimePath(session.workspaceFolder);
+    const runtime = session.configuration.runtime || defaultRuntimePath();
+    const resolvedRuntime = session.configuration.runtime ? runtime : await ensureBundledRuntime(runtime, this.outputChannel);
     const child = spawnQuickJSProcess({
-      runtime,
+      runtime: resolvedRuntime,
       runtimeArgs: session.configuration.runtimeArgs || [],
       host,
       port,
@@ -297,6 +361,11 @@ module.exports = {
   activate,
   deactivate,
   allocatePort,
+  bundledBuildDirectory,
+  defaultRuntimePath,
+  ensureBundledRuntime,
+  repoRootPath,
+  runCommand,
   waitForServer,
   spawnQuickJSProcess,
   QuickJSDebugConfigurationProvider,

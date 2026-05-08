@@ -52,8 +52,7 @@
               },
               "runtime": {
                 "type": "string",
-                "default": "${workspaceFolder}/build-shared/qjs",
-                "description": "Path to the DAP-enabled qjs binary."
+                "description": "Optional path to a DAP-enabled qjs binary. If omitted, the extension uses the bundled repo build at <repo-root>/build-shared/qjs."
               },
               "runtimeArgs": {
                 "type": "array",

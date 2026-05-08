@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "QuickJS DAP: Run Extension Host",
+      "type": "extensionHost",
+      "request": "launch",
+      "runtimeExecutable": "${execPath}",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/tools/vscode-qjs-dap",
+        "${workspaceFolder}/tools/vscode-qjs-dap/example-workspace"
+      ]
+    }
+  ]
+}

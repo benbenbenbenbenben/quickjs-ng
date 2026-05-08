@@ -10,7 +10,9 @@ cmake-*
 out/
 CMakeUserPresets.json
 fuzz
-.vscode/
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
 microbench*.txt
 .zig-cache/
 zig-out/

@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "QuickJS: Launch demo script",
+      "type": "qjs-dap",
+      "request": "launch",
+      "program": "${workspaceFolder}/demo.js",
+      "cwd": "${workspaceFolder}",
+      "stopOnEntry": true
+    },
+    {
+      "name": "QuickJS: Attach to TCP port",
+      "type": "qjs-dap",
+      "request": "attach",
+      "host": "127.0.0.1",
+      "port": 4711
+    }
+  ]
+}
