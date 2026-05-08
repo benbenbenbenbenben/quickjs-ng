@@ -12,6 +12,14 @@ This project is a _fork_ of the [original QuickJS project] by Fabrice Bellard an
 Head over to the [project website] for instructions on how to get started and more
 documentation.
 
+## VS Code demo extension
+
+The repository now includes a small demo VS Code extension for the QuickJS DAP flow at:
+
+`tools/vscode-qjs-dap/`
+
+It is meant to provide a simple launch/attach demo path for stepping, breakpoints, scopes, and variable inspection against a DAP-enabled `qjs` build.
+
 ## Authors
 
 [@bnoordhuis], [@saghul], and many more [contributors].

@@ -597,6 +597,14 @@ static void handle_launch(DAPServer *s, JSValue request) {
     dap_send_response(s, request, JS_UNDEFINED);
 }
 
+static void handle_attach(DAPServer *s, JSValue request) {
+    if (!s->execution_started) {
+        dap_send_error_response(s, request, "attach is only valid for a running target");
+        return;
+    }
+    dap_send_response(s, request, JS_UNDEFINED);
+}
+
 static void handle_set_breakpoints(DAPServer *s, JSValue request) {
     JSValue args = JS_GetPropertyStr(s->ctx, request, "arguments");
     JSValue source = JS_GetPropertyStr(s->ctx, args, "source");
@@ -1083,6 +1091,7 @@ static void process_message(DAPServer *s, JSValue msg) {
         if (cmd) {
             if (strcmp(cmd, "initialize") == 0) handle_initialize(s, msg);
             else if (strcmp(cmd, "launch") == 0) handle_launch(s, msg);
+            else if (strcmp(cmd, "attach") == 0) handle_attach(s, msg);
             else if (strcmp(cmd, "setBreakpoints") == 0) handle_set_breakpoints(s, msg);
             else if (strcmp(cmd, "setExceptionBreakpoints") == 0) handle_set_exception_breakpoints(s, msg);
             else if (strcmp(cmd, "configurationDone") == 0) handle_configuration_done(s, msg);

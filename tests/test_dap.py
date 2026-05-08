@@ -162,6 +162,10 @@ class DAPClient:
         seq = self.send_request("launch", launch_args)
         return self.expect_response(seq, "launch")
 
+    def attach(self):
+        seq = self.send_request("attach", {})
+        return self.expect_response(seq, "attach")
+
     def configuration_done(self):
         seq = self.send_request("configurationDone")
         return self.expect_response(seq, "configurationDone")
@@ -232,6 +236,18 @@ class DAPIntegrationTests(unittest.TestCase):
         exited = client.wait_for_event("exited")
         self.assertEqual(exited["body"]["exitCode"], 0)
         client.wait_for_event("terminated")
+
+    def test_attach_requires_running_target(self):
+        client = self.make_client(
+            """
+            print("unused");
+            """
+        )
+        client.initialize()
+        seq = client.send_request("attach", {})
+        response = client.expect_response(seq, "attach", success=False)
+        self.assertIn("running target", response["message"])
+        client.disconnect()
 
     def test_breakpoint_variables_set_variable_and_globals(self):
         client = self.make_client(
@@ -532,6 +548,8 @@ class DAPIntegrationTests(unittest.TestCase):
         client.reconnect()
 
         client.initialize()
+        client.attach()
+        client.configuration_done()
         seq = client.send_request("pause", {"threadId": 1})
         client.expect_response(seq, "pause")
         stopped = client.wait_for_event("stopped", timeout=20)

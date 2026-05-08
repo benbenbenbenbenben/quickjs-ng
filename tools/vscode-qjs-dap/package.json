@@ -1,0 +1,145 @@
+{
+  "name": "quickjs-ng-vscode-dap-demo",
+  "displayName": "QuickJS DAP Demo",
+  "description": "In-repo VS Code demo extension for QuickJS DAP launch and attach flows.",
+  "version": "0.0.1",
+  "publisher": "quickjs-ng",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onDebugInitialConfigurations",
+    "onDebugResolve:qjs-dap"
+  ],
+  "contributes": {
+    "breakpoints": [
+      {
+        "language": "javascript"
+      },
+      {
+        "language": "javascriptreact"
+      },
+      {
+        "language": "typescript"
+      },
+      {
+        "language": "typescriptreact"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "qjs-dap",
+        "label": "QuickJS DAP",
+        "languages": [
+          "javascript",
+          "javascriptreact",
+          "typescript",
+          "typescriptreact"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "JavaScript entry file to run under QuickJS."
+              },
+              "runtime": {
+                "type": "string",
+                "default": "${workspaceFolder}/build-shared/qjs",
+                "description": "Path to the DAP-enabled qjs binary."
+              },
+              "runtimeArgs": {
+                "type": "array",
+                "description": "Extra CLI flags passed to qjs before the DAP flag.",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "cwd": {
+                "type": "string",
+                "default": "${workspaceFolder}",
+                "description": "Working directory for the spawned qjs process."
+              },
+              "args": {
+                "type": "array",
+                "description": "Arguments forwarded through the DAP launch request.",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "default": false,
+                "description": "Pause on program entry."
+              },
+              "module": {
+                "type": "boolean",
+                "description": "Force module mode for the launched program."
+              },
+              "host": {
+                "type": "string",
+                "default": "127.0.0.1",
+                "description": "Loopback host used to connect VS Code to the spawned qjs DAP TCP server."
+              },
+              "dapLog": {
+                "type": "string",
+                "description": "Optional path passed to qjs via --dap-log=FILE."
+              },
+              "env": {
+                "type": "object",
+                "description": "Extra environment variables for the spawned qjs process.",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "attach": {
+            "required": [
+              "port"
+            ],
+            "properties": {
+              "host": {
+                "type": "string",
+                "default": "127.0.0.1",
+                "description": "QuickJS DAP host."
+              },
+              "port": {
+                "type": "number",
+                "default": 4711,
+                "description": "QuickJS DAP TCP port."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "name": "QuickJS: Launch current file",
+            "type": "qjs-dap",
+            "request": "launch",
+            "program": "${file}",
+            "runtime": "${workspaceFolder}/build-shared/qjs",
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": true
+          },
+          {
+            "name": "QuickJS: Attach to TCP port",
+            "type": "qjs-dap",
+            "request": "attach",
+            "host": "127.0.0.1",
+            "port": 4711
+          }
+        ]
+      }
+    ]
+  }
+}
