@@ -1,136 +1,441 @@
+import argparse
 import json
-import subprocess
-import time
+import pathlib
+import select
 import socket
-import sys
+import subprocess
+import tempfile
+import textwrap
+import time
+import unittest
+from collections import deque
 
-def send_request(sock, command, args=None):
-    request = {
-        "seq": send_request.seq,
-        "type": "request",
-        "command": command
-    }
-    if args:
-        request["arguments"] = args
-    send_request.seq += 1
 
-    msg = json.dumps(request)
-    payload = f"Content-Length: {len(msg)}\r\n\r\n{msg}"
-    print("->", payload.strip())
-    sock.sendall(payload.encode('utf-8'))
+def find_free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
-send_request.seq = 1
 
-def read_message(sock):
-    header = b""
-    while not header.endswith(b"\r\n\r\n"):
-        c = sock.recv(1)
-        if not c:
-            return None
-        header += c
-    
-    header_str = header.decode('utf-8')
-    content_length = 0
-    for line in header_str.split('\r\n'):
-        if line.startswith('Content-Length: '):
-            content_length = int(line[16:])
-            break
-            
-    body = b""
-    while len(body) < content_length:
-        chunk = sock.recv(content_length - len(body))
-        if not chunk:
-            return None
-        body += chunk
-        
-    msg = json.loads(body.decode('utf-8'))
-    print("<-", msg)
-    return msg
+class DAPClient:
+    def __init__(self, qjs_path, script_source):
+        self.qjs_path = str(pathlib.Path(qjs_path).resolve())
+        self.script_source = textwrap.dedent(script_source).lstrip()
+        self.port = find_free_port()
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.script_path = pathlib.Path(self.tmpdir.name, "script.js")
+        self.script_path.write_text(self.script_source)
+        self.proc = None
+        self.sock = None
+        self.seq = 1
+        self.queue = deque()
 
-def test_dap():
-    script = """
-function f() {
-    var x = 42;
-    debugger;
-    console.log("Hello from inside");
-    return x;
-}
-f();
-    """
-    with open("dap_test_script.js", "w") as f:
-        f.write(script.lstrip())
+    def start(self):
+        self.proc = subprocess.Popen(
+            [self.qjs_path, f"--dap=tcp:{self.port}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                self.sock = socket.create_connection(("127.0.0.1", self.port), timeout=0.2)
+                self.sock.settimeout(5)
+                return
+            except OSError:
+                if self.proc.poll() is not None:
+                    raise RuntimeError(f"qjs exited early with status {self.proc.returncode}")
+                time.sleep(0.05)
+        raise RuntimeError("timed out waiting for DAP server")
 
-    p = subprocess.Popen(["./zig-out/bin/qjs", "--dap=tcp:9091", "dap_test_script.js"])
-    time.sleep(0.5)
+    def close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+        if self.proc is not None:
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+            self.proc = None
+        self.tmpdir.cleanup()
 
-    try:
-        sock = socket.create_connection(("127.0.0.1", 9091), timeout=2)
-        
-        send_request(sock, "initialize", {"adapterID": "test"})
-        msg = read_message(sock)
-        msg = read_message(sock)
-        
-        send_request(sock, "configurationDone")
-        msg = read_message(sock)
-        
-        # Now wait for stop (from debugger;)
-        while True:
-            msg = read_message(sock)
-            if not msg: break
-            if msg["type"] == "event" and msg["event"] == "stopped":
+    def send_request(self, command, arguments=None):
+        seq = self.seq
+        request = {
+            "seq": seq,
+            "type": "request",
+            "command": command,
+        }
+        if arguments is not None:
+            request["arguments"] = arguments
+        self.seq += 1
+        payload = json.dumps(request).encode()
+        header = f"Content-Length: {len(payload)}\r\n\r\n".encode()
+        self.sock.sendall(header + payload)
+        return seq
+
+    def _recv_message(self, timeout=5):
+        ready, _, _ = select.select([self.sock], [], [], timeout)
+        if not ready:
+            raise TimeoutError("timed out waiting for DAP message")
+        header = b""
+        while not header.endswith(b"\r\n\r\n"):
+            chunk = self.sock.recv(1)
+            if not chunk:
+                return None
+            header += chunk
+        content_length = 0
+        for line in header.decode().split("\r\n"):
+            if line.startswith("Content-Length: "):
+                content_length = int(line.split(": ", 1)[1])
                 break
-        
-        # Test scopes
-        send_request(sock, "stackTrace", {"threadId": 1})
-        msg = read_message(sock)
-        frame_id = msg["body"]["stackFrames"][0]["id"]
-        
-        send_request(sock, "scopes", {"frameId": frame_id})
-        msg = read_message(sock)
-        locals_ref = msg["body"]["scopes"][0]["variablesReference"]
-        
-        send_request(sock, "variables", {"variablesReference": locals_ref})
-        msg = read_message(sock)
-        assert any(v["name"] == "x" for v in msg["body"]["variables"])
-        
-        # Step over
-        send_request(sock, "next", {"threadId": 1})
-        msg = read_message(sock)
+        body = b""
+        while len(body) < content_length:
+            chunk = self.sock.recv(content_length - len(body))
+            if not chunk:
+                return None
+            body += chunk
+        return json.loads(body.decode())
+
+    def next_message(self, timeout=5):
+        if self.queue:
+            return self.queue.popleft()
+        message = self._recv_message(timeout=timeout)
+        if message is None:
+            raise EOFError("DAP connection closed")
+        return message
+
+    def expect_response(self, seq, command, success=True, timeout=5):
+        deadline = time.time() + timeout
         while True:
-            msg = read_message(sock)
-            if not msg: break
-            if msg["type"] == "event" and msg["event"] == "stopped":
-                break
-                
-        # Evaluate
-        send_request(sock, "evaluate", {"expression": "1 + 1", "frameId": frame_id})
-        msg = read_message(sock)
-        assert msg["body"]["result"] == "2"
-        
-        # Continue
-        send_request(sock, "continue", {"threadId": 1})
-        msg = read_message(sock)
-        
-        got_output = False
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out waiting for response to {command}")
+            msg = self.next_message(timeout=remaining)
+            if msg.get("type") == "response" and msg.get("request_seq") == seq:
+                self._assert_equal(msg.get("command"), command, msg)
+                self._assert_equal(msg.get("success"), success, msg)
+                return msg
+            self.queue.append(msg)
+
+    def wait_for_event(self, event, timeout=5, predicate=None):
+        deadline = time.time() + timeout
         while True:
-            msg = read_message(sock)
-            if not msg: break
-            if msg["type"] == "event" and msg["event"] == "output":
-                if "Hello from inside" in msg["body"]["output"]:
-                    got_output = True
-            if msg["type"] == "event" and msg["event"] == "exited":
-                break
-                
-        send_request(sock, "disconnect")
-        
-        assert got_output, "Did not receive DAP output event with Hello from inside"
-        
-    finally:
-        sock.close()
-        p.wait(timeout=2)
-        print("Exit code:", p.returncode)
-        subprocess.run(["rm", "dap_test_script.js"])
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out waiting for event {event}")
+            msg = self.next_message(timeout=remaining)
+            if msg.get("type") == "event" and msg.get("event") == event:
+                if predicate is None or predicate(msg):
+                    return msg
+            self.queue.append(msg)
+
+    def initialize(self):
+        seq = self.send_request("initialize", {"adapterID": "python-test"})
+        response = self.expect_response(seq, "initialize")
+        self.wait_for_event("initialized")
+        return response
+
+    def launch(self, *, stop_on_entry=False, args=None, module=None):
+        launch_args = {"program": str(self.script_path), "stopOnEntry": stop_on_entry}
+        if args is not None:
+            launch_args["args"] = args
+        if module is not None:
+            launch_args["module"] = module
+        seq = self.send_request("launch", launch_args)
+        return self.expect_response(seq, "launch")
+
+    def configuration_done(self):
+        seq = self.send_request("configurationDone")
+        return self.expect_response(seq, "configurationDone")
+
+    def disconnect(self):
+        seq = self.send_request("disconnect")
+        return self.expect_response(seq, "disconnect")
+
+    @staticmethod
+    def _assert_equal(actual, expected, msg):
+        if actual != expected:
+            raise AssertionError(f"expected {expected!r}, got {actual!r} in {msg!r}")
+
+
+class DAPIntegrationTests(unittest.TestCase):
+    qjs_path = None
+
+    def make_client(self, script):
+        client = DAPClient(self.qjs_path, script)
+        client.start()
+        self.addCleanup(client.close)
+        return client
+
+    def get_top_frame(self, client):
+        seq = client.send_request("stackTrace", {"threadId": 1})
+        response = client.expect_response(seq, "stackTrace")
+        return response["body"]["stackFrames"][0]
+
+    def get_scopes(self, client, frame_id):
+        seq = client.send_request("scopes", {"frameId": frame_id})
+        return client.expect_response(seq, "scopes")["body"]["scopes"]
+
+    def get_variables(self, client, variables_reference):
+        seq = client.send_request("variables", {"variablesReference": variables_reference})
+        response = client.expect_response(seq, "variables")
+        return {entry["name"]: entry["value"] for entry in response["body"]["variables"]}
+
+    def test_launch_stop_on_entry_and_output(self):
+        client = self.make_client(
+            """
+            print("hello from dap");
+            """
+        )
+        init = client.initialize()
+        self.assertTrue(init["body"]["supportsTerminateRequest"])
+        client.launch(stop_on_entry=True)
+        client.configuration_done()
+
+        stopped = client.wait_for_event("stopped")
+        self.assertEqual(stopped["body"]["reason"], "entry")
+
+        seq = client.send_request("threads")
+        threads = client.expect_response(seq, "threads")
+        self.assertEqual(threads["body"]["threads"][0]["name"], "main")
+
+        frame = self.get_top_frame(client)
+        self.assertEqual(pathlib.Path(frame["source"]["path"]).resolve(), client.script_path.resolve())
+
+        seq = client.send_request("continue", {"threadId": 1})
+        client.expect_response(seq, "continue")
+        client.wait_for_event("continued")
+        output = client.wait_for_event("output", predicate=lambda msg: "hello from dap" in msg["body"]["output"])
+        self.assertIn("hello from dap", output["body"]["output"])
+        exited = client.wait_for_event("exited")
+        self.assertEqual(exited["body"]["exitCode"], 0)
+        client.wait_for_event("terminated")
+
+    def test_breakpoint_variables_set_variable_and_globals(self):
+        client = self.make_client(
+            """
+            function test() {
+                let x = 1;
+                let y = 2;
+                print(x, y, globalThis.flag);
+            }
+            globalThis.flag = 0;
+            test();
+            """
+        )
+        client.initialize()
+        client.launch()
+        seq = client.send_request(
+            "setBreakpoints",
+            {
+                "source": {"path": str(client.script_path)},
+                "breakpoints": [{"line": 4}],
+            },
+        )
+        response = client.expect_response(seq, "setBreakpoints")
+        self.assertTrue(response["body"]["breakpoints"][0]["verified"])
+        client.configuration_done()
+
+        stopped = client.wait_for_event("stopped")
+        self.assertEqual(stopped["body"]["reason"], "breakpoint")
+
+        frame = self.get_top_frame(client)
+        scopes = self.get_scopes(client, frame["id"])
+        locals_ref = scopes[0]["variablesReference"]
+        globals_ref = scopes[1]["variablesReference"]
+
+        locals_before = self.get_variables(client, locals_ref)
+        self.assertEqual(locals_before["x"], "1")
+        self.assertEqual(locals_before["y"], "2")
+
+        seq = client.send_request("evaluate", {"expression": "1 + 1", "frameId": frame["id"]})
+        evaluate = client.expect_response(seq, "evaluate")
+        self.assertEqual(evaluate["body"]["result"], "2")
+
+        seq = client.send_request("setVariable", {"variablesReference": locals_ref, "name": "x", "value": "41"})
+        set_local = client.expect_response(seq, "setVariable")
+        self.assertEqual(set_local["body"]["value"], "41")
+
+        seq = client.send_request("setVariable", {"variablesReference": globals_ref, "name": "flag", "value": "7"})
+        set_global = client.expect_response(seq, "setVariable")
+        self.assertEqual(set_global["body"]["value"], "7")
+
+        locals_after = self.get_variables(client, locals_ref)
+        globals_after = self.get_variables(client, globals_ref)
+        self.assertEqual(locals_after["x"], "41")
+        self.assertEqual(globals_after["flag"], "7")
+
+        seq = client.send_request("continue", {"threadId": 1})
+        client.expect_response(seq, "continue")
+        client.wait_for_event("continued")
+        output = client.wait_for_event("output", predicate=lambda msg: "41 2 7" in msg["body"]["output"])
+        self.assertIn("41 2 7", output["body"]["output"])
+        client.wait_for_event("exited")
+        client.wait_for_event("terminated")
+
+    def test_conditional_breakpoint(self):
+        client = self.make_client(
+            """
+            function test() {
+                let x = 1;
+                x += 1;
+                print(x);
+            }
+            test();
+            """
+        )
+        client.initialize()
+        client.launch()
+        seq = client.send_request(
+            "setBreakpoints",
+            {
+                "source": {"path": str(client.script_path)},
+                "breakpoints": [{"line": 4, "condition": "x === 2"}],
+            },
+        )
+        client.expect_response(seq, "setBreakpoints")
+        client.configuration_done()
+
+        stopped = client.wait_for_event("stopped")
+        self.assertEqual(stopped["body"]["reason"], "breakpoint")
+        self.assertEqual(stopped["body"]["hitBreakpointIds"], [1])
+
+        frame = self.get_top_frame(client)
+        scopes = self.get_scopes(client, frame["id"])
+        locals_after = self.get_variables(client, scopes[0]["variablesReference"])
+        self.assertEqual(locals_after["x"], "2")
+
+        seq = client.send_request("continue", {"threadId": 1})
+        client.expect_response(seq, "continue")
+        client.wait_for_event("continued")
+        output = client.wait_for_event("output", predicate=lambda msg: "2" in msg["body"]["output"])
+        self.assertIn("2", output["body"]["output"])
+        client.wait_for_event("exited")
+        client.wait_for_event("terminated")
+
+    def test_debugger_and_step_commands(self):
+        client = self.make_client(
+            """
+            function inner(v) {
+                let next = v + 1;
+                return next;
+            }
+            function outer() {
+                let x = 1;
+                debugger;
+                x = inner(x);
+                x = x + 1;
+                return x;
+            }
+            print(outer());
+            """
+        )
+        client.initialize()
+        client.launch()
+        seq = client.send_request(
+            "setBreakpoints",
+            {
+                "source": {"path": str(client.script_path)},
+                "breakpoints": [{"line": 8}],
+            },
+        )
+        client.expect_response(seq, "setBreakpoints")
+        client.configuration_done()
+
+        stopped = client.wait_for_event("stopped")
+        self.assertEqual(stopped["body"]["reason"], "debugger_statement")
+        self.assertEqual(self.get_top_frame(client)["name"], "outer")
+
+        seq = client.send_request("continue", {"threadId": 1})
+        client.expect_response(seq, "continue")
+        client.wait_for_event("continued")
+        stopped = client.wait_for_event("stopped")
+        self.assertEqual(stopped["body"]["reason"], "breakpoint")
+        self.assertEqual(self.get_top_frame(client)["name"], "outer")
+
+        seq = client.send_request("stepIn", {"threadId": 1})
+        client.expect_response(seq, "stepIn")
+        client.wait_for_event("continued")
+        stopped = client.wait_for_event("stopped")
+        self.assertEqual(stopped["body"]["reason"], "step")
+        self.assertEqual(pathlib.Path(self.get_top_frame(client)["source"]["path"]).resolve(), client.script_path.resolve())
+
+        seq = client.send_request("stepOut", {"threadId": 1})
+        client.expect_response(seq, "stepOut")
+        client.wait_for_event("continued")
+        output = client.wait_for_event("output", predicate=lambda msg: "3" in msg["body"]["output"])
+        self.assertIn("3", output["body"]["output"])
+        client.wait_for_event("exited")
+        client.wait_for_event("terminated")
+
+    def test_exception_info(self):
+        client = self.make_client(
+            """
+            function boom() {
+                throw new TypeError("boom");
+            }
+            try {
+                boom();
+            } catch (err) {
+                print(err.name);
+            }
+            """
+        )
+        client.initialize()
+        client.launch()
+        seq = client.send_request("setExceptionBreakpoints", {"filters": ["all"]})
+        client.expect_response(seq, "setExceptionBreakpoints")
+        client.configuration_done()
+
+        stopped = client.wait_for_event("stopped")
+        self.assertEqual(stopped["body"]["reason"], "exception")
+
+        seq = client.send_request("exceptionInfo", {"threadId": 1})
+        info = client.expect_response(seq, "exceptionInfo")
+        self.assertTrue(info["body"]["exceptionId"])
+        self.assertEqual(info["body"]["breakMode"], "always")
+
+        client.disconnect()
+
+    def test_pause_while_running(self):
+        client = self.make_client(
+            """
+            let value = 0;
+            while (value < 500000000) {
+                value++;
+            }
+            print("done", value);
+            """
+        )
+        client.initialize()
+        client.launch()
+        client.configuration_done()
+
+        seq = client.send_request("pause", {"threadId": 1})
+        client.expect_response(seq, "pause")
+        stopped = client.wait_for_event("stopped", timeout=10)
+        self.assertEqual(stopped["body"]["reason"], "pause")
+
+        seq = client.send_request("terminate")
+        client.expect_response(seq, "terminate")
+        client.proc.wait(timeout=30)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("qjs", help="path to qjs binary with DAP enabled")
+    args = parser.parse_args()
+    DAPIntegrationTests.qjs_path = args.qjs
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(DAPIntegrationTests)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    raise SystemExit(0 if result.wasSuccessful() else 1)
+
 
 if __name__ == "__main__":
-    test_dap()
-    print("DAP integration tests passed!")
+    main()

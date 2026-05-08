@@ -4,9 +4,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#ifdef _WIN32
+#if !defined(_WIN32)
+#include <sys/select.h>
+#endif
+#if QJS_DAP_HAVE_SOCKETS && defined(_WIN32)
 #include <winsock2.h>
-#else
+#elif QJS_DAP_HAVE_SOCKETS
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -16,8 +19,19 @@ struct DAPServer {
     JSContext *ctx;
     DAPTransport *transport;
     JSDebugState *debug_state;
+    char *launch_program;
+    char **launch_args;
+    int launch_argc;
+    int launch_module;
+    bool launch_stop_on_entry;
+    bool entry_stop_pending;
+    bool initialized;
+    bool launch_received;
     bool configuration_done;
     bool is_disconnecting;
+    bool pause_requested;
+    bool terminate_requested;
+    FILE *log_fp;
     int seq;
 };
 
@@ -32,6 +46,15 @@ static int js_get_int(JSContext *ctx, JSValue obj, const char *prop, int default
     if (JS_ToInt32(ctx, &i, v) < 0) i = default_val;
     JS_FreeValue(ctx, v);
     return i;
+}
+
+static int js_get_bool(JSContext *ctx, JSValue obj, const char *prop, int default_val) {
+    JSValue v = JS_GetPropertyStr(ctx, obj, prop);
+    int ret = default_val;
+    if (!JS_IsUndefined(v) && !JS_IsException(v))
+        ret = JS_ToBool(ctx, v);
+    JS_FreeValue(ctx, v);
+    return ret < 0 ? default_val : ret;
 }
 
 static const char *js_get_str(JSContext *ctx, JSValue obj, const char *prop) {
@@ -53,6 +76,24 @@ static int stdio_send(DAPTransport *t, const char *buf, size_t len) {
     fflush(stdout);
     return w == len ? 0 : -1;
 }
+static int stdio_poll(DAPTransport *t, int timeout_ms) {
+    (void)t;
+#ifdef _WIN32
+    (void)timeout_ms;
+    return 0;
+#else
+    int fd = fileno(stdin);
+    struct timeval tv;
+    fd_set rfds;
+    if (fd < 0)
+        return -1;
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    return select(fd + 1, &rfds, NULL, NULL, &tv);
+#endif
+}
 static void stdio_close(DAPTransport *t) {
     js_free(NULL, t);
 }
@@ -60,11 +101,13 @@ DAPTransport *DAP_NewStdioTransport(void) {
     DAPTransport *t = malloc(sizeof(DAPTransport));
     t->recv = stdio_recv;
     t->send = stdio_send;
+    t->poll = stdio_poll;
     t->close = stdio_close;
     return t;
 }
 
 /* --- TCP Transport implementation --- */
+#if QJS_DAP_HAVE_SOCKETS
 struct TCPTransportData {
     int server_fd;
     int client_fd;
@@ -82,6 +125,19 @@ static int tcp_send(DAPTransport *t, const char *buf, size_t len) {
     if (d->client_fd < 0) return -1;
     ssize_t w = send(d->client_fd, buf, len, 0);
     return w == len ? 0 : -1;
+}
+
+static int tcp_poll(DAPTransport *t, int timeout_ms) {
+    struct TCPTransportData *d = (struct TCPTransportData *)t->opaque;
+    fd_set rfds;
+    struct timeval tv;
+    if (d->client_fd < 0)
+        return -1;
+    FD_ZERO(&rfds);
+    FD_SET(d->client_fd, &rfds);
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    return select(d->client_fd + 1, &rfds, NULL, NULL, &tv);
 }
 
 static void tcp_close(DAPTransport *t) {
@@ -156,9 +212,47 @@ DAPTransport *DAP_NewTCPTransport(int port) {
     t->opaque = d;
     t->recv = tcp_recv;
     t->send = tcp_send;
+    t->poll = tcp_poll;
     t->close = tcp_close;
-    
+
     return t;
+}
+#else
+DAPTransport *DAP_NewTCPTransport(int port) {
+    (void)port;
+    fprintf(stderr, "qjs: TCP DAP transport is not supported on this target\n");
+    return NULL;
+}
+#endif
+
+static bool dap_is_stopped(DAPServer *s) {
+    return s->debug_state->paused && s->debug_state->has_stop_state;
+}
+
+static int dap_pause_callback(JSRuntime *rt, void *opaque, JSDebugReason reason, const uint8_t *pc);
+
+static void dap_clear_launch_config(DAPServer *s) {
+    int i;
+    free(s->launch_program);
+    s->launch_program = NULL;
+    if (s->launch_args) {
+        for (i = 0; i < s->launch_argc; i++)
+            free(s->launch_args[i]);
+        free(s->launch_args);
+    }
+    s->launch_args = NULL;
+    s->launch_argc = 0;
+    s->launch_module = -1;
+    s->launch_stop_on_entry = false;
+}
+
+static void dap_log_json(DAPServer *s, const char *direction, const char *json, size_t len) {
+    if (!s->log_fp)
+        return;
+    fprintf(s->log_fp, "%s ", direction);
+    fwrite(json, 1, len, s->log_fp);
+    fputc('\n', s->log_fp);
+    fflush(s->log_fp);
 }
 
 static JSValue js_print_dap(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
@@ -212,6 +306,7 @@ static void dap_send_json(DAPServer *s, JSValue obj) {
     if (JS_IsString(str)) {
         size_t len;
         const char *cstr = JS_ToCStringLen(s->ctx, &len, str);
+        dap_log_json(s, "->", cstr, len);
         char header[128];
         int hlen = snprintf(header, sizeof(header), "Content-Length: %zu\r\n\r\n", len);
         s->transport->send(s->transport, header, hlen);
@@ -249,16 +344,112 @@ static void dap_send_response(DAPServer *s, JSValue request, JSValue body) {
     JS_FreeValue(s->ctx, msg);
 }
 
+static void dap_send_error_response(DAPServer *s, JSValue request, const char *message) {
+    JSValue msg = JS_NewObject(s->ctx);
+    JSValue body = JS_NewObject(s->ctx);
+    JSValue err = JS_NewObject(s->ctx);
+
+    JS_SetPropertyStr(s->ctx, msg, "seq", JS_NewInt32(s->ctx, ++s->seq));
+    JS_SetPropertyStr(s->ctx, msg, "type", JS_NewString(s->ctx, "response"));
+    JS_SetPropertyStr(s->ctx, msg, "request_seq", JS_GetPropertyStr(s->ctx, request, "seq"));
+    JS_SetPropertyStr(s->ctx, msg, "command", JS_GetPropertyStr(s->ctx, request, "command"));
+    JS_SetPropertyStr(s->ctx, msg, "success", JS_NewBool(s->ctx, false));
+    JS_SetPropertyStr(s->ctx, msg, "message", JS_NewString(s->ctx, message));
+    JS_SetPropertyStr(s->ctx, err, "format", JS_NewString(s->ctx, message));
+    JS_SetPropertyStr(s->ctx, body, "error", err);
+    JS_SetPropertyStr(s->ctx, msg, "body", body);
+    dap_send_json(s, msg);
+    JS_FreeValue(s->ctx, msg);
+}
+
+static void dap_send_continued_event(DAPServer *s) {
+    JSValue body = JS_NewObject(s->ctx);
+    JS_SetPropertyStr(s->ctx, body, "threadId", JS_NewInt32(s->ctx, 1));
+    JS_SetPropertyStr(s->ctx, body, "allThreadsContinued", JS_NewBool(s->ctx, true));
+    dap_send_event(s, "continued", body);
+}
+
+static const char *dap_stop_reason_string(DAPServer *s) {
+    if (!s->debug_state->has_stop_state)
+        return "pause";
+    switch (s->debug_state->stop_reason) {
+    case JS_DEBUG_REASON_BREAKPOINT:
+        return "breakpoint";
+    case JS_DEBUG_REASON_STEP:
+        return "step";
+    case JS_DEBUG_REASON_EXCEPTION:
+        return "exception";
+    case JS_DEBUG_REASON_DEBUGGER:
+        return "debugger_statement";
+    case JS_DEBUG_REASON_ENTRY:
+        return "entry";
+    case JS_DEBUG_REASON_POLL:
+    case JS_DEBUG_REASON_EXIT:
+    default:
+        return "pause";
+    }
+}
+
+static JSValue dap_stringify_value(JSContext *ctx, JSValueConst value) {
+    JSValue str_val = JS_ToString(ctx, value);
+    if (JS_IsException(str_val)) {
+        JS_GetException(ctx);
+        return JS_NewString(ctx, "");
+    }
+    return str_val;
+}
+
 /* --- Message processing --- */
 static void handle_initialize(DAPServer *s, JSValue request) {
     JSValue body = JS_NewObject(s->ctx);
     JS_SetPropertyStr(s->ctx, body, "supportsConfigurationDoneRequest", JS_NewBool(s->ctx, true));
     JS_SetPropertyStr(s->ctx, body, "supportsEvaluateForHovers", JS_NewBool(s->ctx, true));
+    JS_SetPropertyStr(s->ctx, body, "supportsSetVariable", JS_NewBool(s->ctx, true));
+    JS_SetPropertyStr(s->ctx, body, "supportsConditionalBreakpoints", JS_NewBool(s->ctx, true));
+    JS_SetPropertyStr(s->ctx, body, "supportsExceptionInfoRequest", JS_NewBool(s->ctx, true));
+    JS_SetPropertyStr(s->ctx, body, "supportsTerminateRequest", JS_NewBool(s->ctx, true));
     dap_send_response(s, request, body);
+    s->initialized = true;
     dap_send_event(s, "initialized", JS_UNDEFINED);
 }
 
 static void handle_launch(DAPServer *s, JSValue request) {
+    JSValue args = JS_GetPropertyStr(s->ctx, request, "arguments");
+    JSValue argv = JS_GetPropertyStr(s->ctx, args, "args");
+    const char *program = js_get_str(s->ctx, args, "program");
+    int64_t argc = 0;
+
+    dap_clear_launch_config(s);
+    if (program) {
+        s->launch_program = strdup(program);
+        JS_FreeCString(s->ctx, program);
+    }
+    if (!JS_IsUndefined(argv))
+        JS_GetLength(s->ctx, argv, &argc);
+    if (argc > 0) {
+        s->launch_args = calloc((size_t)argc, sizeof(*s->launch_args));
+        if (!s->launch_args) {
+            JS_FreeValue(s->ctx, argv);
+            JS_FreeValue(s->ctx, args);
+            dap_send_error_response(s, request, "failed to allocate launch arguments");
+            return;
+        }
+        s->launch_argc = (int)argc;
+        for (int64_t i = 0; i < argc; i++) {
+            JSValue arg = JS_GetPropertyInt64(s->ctx, argv, i);
+            const char *arg_str = JS_ToCString(s->ctx, arg);
+            if (arg_str) {
+                s->launch_args[i] = strdup(arg_str);
+                JS_FreeCString(s->ctx, arg_str);
+            }
+            JS_FreeValue(s->ctx, arg);
+        }
+    }
+    s->launch_stop_on_entry = js_get_bool(s->ctx, args, "stopOnEntry", false);
+    s->launch_module = js_get_bool(s->ctx, args, "module", -1);
+    s->launch_received = true;
+    JS_FreeValue(s->ctx, argv);
+    JS_FreeValue(s->ctx, args);
     dap_send_response(s, request, JS_UNDEFINED);
 }
 
@@ -332,31 +523,66 @@ static void handle_set_exception_breakpoints(DAPServer *s, JSValue request) {
 }
 
 static void handle_configuration_done(DAPServer *s, JSValue request) {
+    if (!s->initialized) {
+        dap_send_error_response(s, request, "initialize must be called before configurationDone");
+        return;
+    }
     s->configuration_done = true;
     dap_send_response(s, request, JS_UNDEFINED);
 }
 
+static void handle_threads(DAPServer *s, JSValue request) {
+    JSValue threads = JS_NewArray(s->ctx);
+    JSValue thread = JS_NewObject(s->ctx);
+    JSValue body = JS_NewObject(s->ctx);
+    JS_SetPropertyStr(s->ctx, thread, "id", JS_NewInt32(s->ctx, 1));
+    JS_SetPropertyStr(s->ctx, thread, "name", JS_NewString(s->ctx, "main"));
+    JS_SetPropertyUint32(s->ctx, threads, 0, thread);
+    JS_SetPropertyStr(s->ctx, body, "threads", threads);
+    dap_send_response(s, request, body);
+}
+
 static void handle_continue(DAPServer *s, JSValue request) {
     JS_DebugContinue(s->debug_state);
-    dap_send_response(s, request, JS_UNDEFINED);
+    s->pause_requested = false;
+    JSValue body = JS_NewObject(s->ctx);
+    JS_SetPropertyStr(s->ctx, body, "allThreadsContinued", JS_NewBool(s->ctx, true));
+    dap_send_response(s, request, body);
+    dap_send_continued_event(s);
 }
 
 static void handle_next(DAPServer *s, JSValue request) {
     JS_DebugStepOver(s->debug_state);
-    dap_send_response(s, request, JS_UNDEFINED);
+    s->pause_requested = false;
+    JSValue body = JS_NewObject(s->ctx);
+    JS_SetPropertyStr(s->ctx, body, "allThreadsContinued", JS_NewBool(s->ctx, true));
+    dap_send_response(s, request, body);
+    dap_send_continued_event(s);
 }
 
 static void handle_step_in(DAPServer *s, JSValue request) {
     JS_DebugStepInto(s->debug_state);
-    dap_send_response(s, request, JS_UNDEFINED);
+    s->pause_requested = false;
+    JSValue body = JS_NewObject(s->ctx);
+    JS_SetPropertyStr(s->ctx, body, "allThreadsContinued", JS_NewBool(s->ctx, true));
+    dap_send_response(s, request, body);
+    dap_send_continued_event(s);
 }
 
 static void handle_step_out(DAPServer *s, JSValue request) {
     JS_DebugStepOut(s->debug_state);
-    dap_send_response(s, request, JS_UNDEFINED);
+    s->pause_requested = false;
+    JSValue body = JS_NewObject(s->ctx);
+    JS_SetPropertyStr(s->ctx, body, "allThreadsContinued", JS_NewBool(s->ctx, true));
+    dap_send_response(s, request, body);
+    dap_send_continued_event(s);
 }
 
 static void handle_stack_trace(DAPServer *s, JSValue request) {
+    if (!dap_is_stopped(s)) {
+        dap_send_error_response(s, request, "stackTrace is only available while paused");
+        return;
+    }
     JSStackFrameInfo *frames = NULL;
     int count = JS_GetStackTrace(s->ctx, &frames, 50);
     
@@ -396,6 +622,10 @@ static void handle_stack_trace(DAPServer *s, JSValue request) {
 }
 
 static void handle_scopes(DAPServer *s, JSValue request) {
+    if (!dap_is_stopped(s)) {
+        dap_send_error_response(s, request, "scopes is only available while paused");
+        return;
+    }
     JSValue args = JS_GetPropertyStr(s->ctx, request, "arguments");
     int frame_id = js_get_int(s->ctx, args, "frameId", 0);
     JS_FreeValue(s->ctx, args);
@@ -422,6 +652,10 @@ static void handle_scopes(DAPServer *s, JSValue request) {
 }
 
 static void handle_variables(DAPServer *s, JSValue request) {
+    if (!dap_is_stopped(s)) {
+        dap_send_error_response(s, request, "variables is only available while paused");
+        return;
+    }
     JSValue args = JS_GetPropertyStr(s->ctx, request, "arguments");
     int var_ref = js_get_int(s->ctx, args, "variablesReference", 0);
     JS_FreeValue(s->ctx, args);
@@ -485,6 +719,10 @@ static void handle_variables(DAPServer *s, JSValue request) {
 }
 
 static void handle_evaluate(DAPServer *s, JSValue request) {
+    if (!dap_is_stopped(s)) {
+        dap_send_error_response(s, request, "evaluate is only available while paused");
+        return;
+    }
     JSValue args = JS_GetPropertyStr(s->ctx, request, "arguments");
     const char *expr = js_get_str(s->ctx, args, "expression");
     int frame_id = js_get_int(s->ctx, args, "frameId", 0);
@@ -510,9 +748,162 @@ static void handle_evaluate(DAPServer *s, JSValue request) {
     dap_send_response(s, request, body);
 }
 
+static void handle_set_variable(DAPServer *s, JSValue request) {
+    JSValue args;
+    JSValue eval_result;
+    JSValue body;
+    JSValue stringified;
+    const char *name;
+    const char *value_expr;
+    const char *value_cstr;
+    int var_ref;
+    int ret;
+
+    if (!dap_is_stopped(s)) {
+        dap_send_error_response(s, request, "setVariable is only available while paused");
+        return;
+    }
+
+    args = JS_GetPropertyStr(s->ctx, request, "arguments");
+    name = js_get_str(s->ctx, args, "name");
+    value_expr = js_get_str(s->ctx, args, "value");
+    var_ref = js_get_int(s->ctx, args, "variablesReference", 0);
+    if (!name || !value_expr) {
+        if (name) JS_FreeCString(s->ctx, name);
+        if (value_expr) JS_FreeCString(s->ctx, value_expr);
+        JS_FreeValue(s->ctx, args);
+        dap_send_error_response(s, request, "setVariable requires name and value");
+        return;
+    }
+
+    eval_result = JS_EvaluateAtFrame(s->ctx, var_ref >= 1000 ? var_ref - 1000 : 0,
+                                     value_expr, strlen(value_expr));
+    if (JS_IsException(eval_result)) {
+        JS_FreeCString(s->ctx, name);
+        JS_FreeCString(s->ctx, value_expr);
+        JS_FreeValue(s->ctx, args);
+        JS_FreeValue(s->ctx, JS_GetException(s->ctx));
+        dap_send_error_response(s, request, "failed to evaluate setVariable value");
+        return;
+    }
+
+    if (var_ref == 1) {
+        ret = JS_SetGlobalVariable(s->ctx, name, eval_result);
+    } else if (var_ref >= 1000) {
+        ret = JS_SetFrameLocal(s->ctx, var_ref - 1000, name, eval_result);
+    } else {
+        ret = -1;
+    }
+
+    JS_FreeCString(s->ctx, name);
+    JS_FreeCString(s->ctx, value_expr);
+    JS_FreeValue(s->ctx, args);
+    if (ret < 0) {
+        JS_FreeValue(s->ctx, eval_result);
+        dap_send_error_response(s, request, "failed to set variable");
+        return;
+    }
+
+    body = JS_NewObject(s->ctx);
+    stringified = dap_stringify_value(s->ctx, eval_result);
+    value_cstr = JS_ToCString(s->ctx, stringified);
+    JS_SetPropertyStr(s->ctx, body, "value", JS_NewString(s->ctx, value_cstr ? value_cstr : ""));
+    JS_SetPropertyStr(s->ctx, body, "variablesReference", JS_NewInt32(s->ctx, 0));
+    if (value_cstr)
+        JS_FreeCString(s->ctx, value_cstr);
+    JS_FreeValue(s->ctx, stringified);
+    JS_FreeValue(s->ctx, eval_result);
+    dap_send_response(s, request, body);
+}
+
+static int dap_refresh_stop_exception(DAPServer *s) {
+    if (!JS_IsUndefined(s->debug_state->stop_exception))
+        return 0;
+    s->debug_state->stop_exception = JS_PeekException(s->ctx);
+    if (JS_IsUndefined(s->debug_state->stop_exception))
+        return -1;
+    s->debug_state->stop_exception_uncatchable =
+        JS_IsUncatchableError(s->debug_state->stop_exception);
+    return 0;
+}
+
+static void handle_exception_info(DAPServer *s, JSValue request) {
+    JSValue body;
+    JSValue details;
+    JSValue stringified;
+    JSValue name_val;
+    const char *description;
+    const char *type_name;
+
+    if (!dap_is_stopped(s) || s->debug_state->stop_reason != JS_DEBUG_REASON_EXCEPTION) {
+        dap_send_error_response(s, request, "exceptionInfo is only available for exception stops");
+        return;
+    }
+    if (JS_IsUndefined(s->debug_state->stop_exception) && dap_refresh_stop_exception(s) < 0) {
+        body = JS_NewObject(s->ctx);
+        details = JS_NewObject(s->ctx);
+        JS_SetPropertyStr(s->ctx, body, "exceptionId", JS_NewString(s->ctx, "Error"));
+        JS_SetPropertyStr(s->ctx, body, "breakMode",
+                          JS_NewString(s->ctx, s->debug_state->stop_exception_uncatchable ? "uncaught" : "always"));
+        JS_SetPropertyStr(s->ctx, body, "description", JS_NewString(s->ctx, ""));
+        JS_SetPropertyStr(s->ctx, details, "message", JS_NewString(s->ctx, ""));
+        JS_SetPropertyStr(s->ctx, details, "typeName", JS_NewString(s->ctx, "Error"));
+        JS_SetPropertyStr(s->ctx, body, "details", details);
+        dap_send_response(s, request, body);
+        return;
+    }
+
+    body = JS_NewObject(s->ctx);
+    details = JS_NewObject(s->ctx);
+    stringified = dap_stringify_value(s->ctx, s->debug_state->stop_exception);
+    description = JS_ToCString(s->ctx, stringified);
+    name_val = JS_GetPropertyStr(s->ctx, s->debug_state->stop_exception, "name");
+    if (JS_IsString(name_val)) {
+        type_name = JS_ToCString(s->ctx, name_val);
+    } else {
+        type_name = NULL;
+    }
+
+    JS_SetPropertyStr(s->ctx, body, "exceptionId",
+                      JS_NewString(s->ctx, type_name ? type_name : "Error"));
+    JS_SetPropertyStr(s->ctx, body, "breakMode",
+                      JS_NewString(s->ctx, s->debug_state->stop_exception_uncatchable ? "uncaught" : "always"));
+    JS_SetPropertyStr(s->ctx, body, "description",
+                      JS_NewString(s->ctx, description ? description : ""));
+    JS_SetPropertyStr(s->ctx, details, "message",
+                      JS_NewString(s->ctx, description ? description : ""));
+    JS_SetPropertyStr(s->ctx, details, "typeName",
+                      JS_NewString(s->ctx, type_name ? type_name : "Error"));
+    JS_SetPropertyStr(s->ctx, body, "details", details);
+
+    if (type_name)
+        JS_FreeCString(s->ctx, type_name);
+    if (description)
+        JS_FreeCString(s->ctx, description);
+    JS_FreeValue(s->ctx, name_val);
+    JS_FreeValue(s->ctx, stringified);
+    dap_send_response(s, request, body);
+}
+
+static void handle_pause(DAPServer *s, JSValue request) {
+    s->pause_requested = true;
+    dap_send_response(s, request, JS_UNDEFINED);
+    if (dap_is_stopped(s) && !s->debug_state->is_evaluating) {
+        dap_pause_callback(JS_GetRuntime(s->ctx), s, JS_DEBUG_REASON_POLL, NULL);
+    }
+}
+
 static void handle_disconnect(DAPServer *s, JSValue request) {
     s->is_disconnecting = true;
     JS_DebugContinue(s->debug_state);
+    dap_send_response(s, request, JS_UNDEFINED);
+}
+
+static void handle_terminate(DAPServer *s, JSValue request) {
+    s->terminate_requested = true;
+    s->is_disconnecting = true;
+    if (s->debug_state->paused)
+        JS_DebugContinue(s->debug_state);
     dap_send_response(s, request, JS_UNDEFINED);
 }
 
@@ -526,6 +917,7 @@ static void process_message(DAPServer *s, JSValue msg) {
             else if (strcmp(cmd, "setBreakpoints") == 0) handle_set_breakpoints(s, msg);
             else if (strcmp(cmd, "setExceptionBreakpoints") == 0) handle_set_exception_breakpoints(s, msg);
             else if (strcmp(cmd, "configurationDone") == 0) handle_configuration_done(s, msg);
+            else if (strcmp(cmd, "threads") == 0) handle_threads(s, msg);
             else if (strcmp(cmd, "continue") == 0) handle_continue(s, msg);
             else if (strcmp(cmd, "next") == 0) handle_next(s, msg);
             else if (strcmp(cmd, "stepIn") == 0) handle_step_in(s, msg);
@@ -533,9 +925,13 @@ static void process_message(DAPServer *s, JSValue msg) {
             else if (strcmp(cmd, "stackTrace") == 0) handle_stack_trace(s, msg);
             else if (strcmp(cmd, "scopes") == 0) handle_scopes(s, msg);
             else if (strcmp(cmd, "variables") == 0) handle_variables(s, msg);
+            else if (strcmp(cmd, "setVariable") == 0) handle_set_variable(s, msg);
             else if (strcmp(cmd, "evaluate") == 0) handle_evaluate(s, msg);
+            else if (strcmp(cmd, "exceptionInfo") == 0) handle_exception_info(s, msg);
+            else if (strcmp(cmd, "pause") == 0) handle_pause(s, msg);
             else if (strcmp(cmd, "disconnect") == 0) handle_disconnect(s, msg);
-            else dap_send_response(s, msg, JS_UNDEFINED); // Ignore unknown
+            else if (strcmp(cmd, "terminate") == 0) handle_terminate(s, msg);
+            else dap_send_error_response(s, msg, "unsupported DAP request");
             JS_FreeCString(s->ctx, cmd);
         }
     }
@@ -544,6 +940,7 @@ static void process_message(DAPServer *s, JSValue msg) {
 
 static int read_message(DAPServer *s) {
     char header[256];
+    bool was_evaluating;
     int hidx = 0;
     while (hidx < sizeof(header) - 1) {
         if (s->transport->recv(s->transport, &header[hidx], 1) <= 0) return -1;
@@ -572,29 +969,71 @@ static int read_message(DAPServer *s) {
         read_len += r;
     }
     buf[len] = '\0';
-    
+    dap_log_json(s, "<-", buf, len);
+
+    was_evaluating = s->debug_state->is_evaluating;
+    s->debug_state->is_evaluating = true;
     JSValue msg = JS_ParseJSON(s->ctx, buf, len, "<dap>");
     free(buf);
     
     if (JS_IsException(msg)) {
+        s->debug_state->is_evaluating = was_evaluating;
         JS_GetException(s->ctx); // clear
         return -1;
     }
     
     process_message(s, msg);
+    s->debug_state->is_evaluating = was_evaluating;
     JS_FreeValue(s->ctx, msg);
+    return 0;
+}
+
+static int dap_interrupt_handler(JSRuntime *rt, void *opaque) {
+    DAPServer *s = (DAPServer *)opaque;
+    (void)rt;
+
+    if (s->terminate_requested || s->is_disconnecting)
+        return 1;
+
+    if (!s->transport->poll || s->transport->poll(s->transport, 0) <= 0)
+        return 0;
+
+    if (read_message(s) < 0) {
+        s->is_disconnecting = true;
+        return 1;
+    }
+    if (s->terminate_requested || s->is_disconnecting)
+        return 1;
+    if (s->pause_requested)
+        JS_DebugPause(s->debug_state);
     return 0;
 }
 
 static int dap_pause_callback(JSRuntime *rt, void *opaque, JSDebugReason reason, const uint8_t *pc) {
     DAPServer *s = (DAPServer*)opaque;
-    if (s->is_disconnecting) return 0;
-    
+    const char *stop_reason;
+    (void)rt;
+    (void)reason;
+    (void)pc;
+    if (s->is_disconnecting || s->debug_state->is_evaluating) return 0;
+     
     JSValue body = JS_NewObject(s->ctx);
-    JS_SetPropertyStr(s->ctx, body, "reason", JS_NewString(s->ctx, "step"));
+    if (s->entry_stop_pending) {
+        s->entry_stop_pending = false;
+        s->debug_state->stop_reason = JS_DEBUG_REASON_ENTRY;
+    }
+    stop_reason = dap_stop_reason_string(s);
+    JS_SetPropertyStr(s->ctx, body, "reason", JS_NewString(s->ctx, stop_reason));
     JS_SetPropertyStr(s->ctx, body, "threadId", JS_NewInt32(s->ctx, 1));
+    if (s->debug_state->stop_reason == JS_DEBUG_REASON_BREAKPOINT &&
+        s->debug_state->stop_breakpoint_id > 0) {
+        JSValue hits = JS_NewArray(s->ctx);
+        JS_SetPropertyUint32(s->ctx, hits, 0, JS_NewInt32(s->ctx, s->debug_state->stop_breakpoint_id));
+        JS_SetPropertyStr(s->ctx, body, "hitBreakpointIds", hits);
+    }
     dap_send_event(s, "stopped", body);
-    
+    s->pause_requested = false;
+     
     while (s->debug_state->paused && !s->is_disconnecting) {
         if (read_message(s) < 0) {
             s->is_disconnecting = true;
@@ -609,14 +1048,21 @@ DAPServer *DAP_NewServer(JSContext *ctx, DAPTransport *transport) {
     s->ctx = ctx;
     s->transport = transport;
     s->debug_state = JS_NewDebugState(ctx);
+    dap_clear_launch_config(s);
     s->debug_state->pause_callback = dap_pause_callback;
     s->debug_state->user_opaque = s;
     JS_SetContextOpaque(ctx, s);
     JS_SetDebugHandler(JS_GetRuntime(ctx), js_debug_handler, s->debug_state);
+    JS_SetInterruptHandler(JS_GetRuntime(ctx), dap_interrupt_handler, s);
     return s;
 }
 
 void DAP_FreeServer(DAPServer *server) {
+    JS_SetInterruptHandler(JS_GetRuntime(server->ctx), NULL, NULL);
+    JS_SetDebugHandler(JS_GetRuntime(server->ctx), NULL, NULL);
+    dap_clear_launch_config(server);
+    if (server->log_fp)
+        fclose(server->log_fp);
     if (server->transport && server->transport->close) {
         server->transport->close(server->transport);
     }
@@ -628,7 +1074,7 @@ int DAP_WaitForLaunch(DAPServer *server) {
     while (!server->configuration_done && !server->is_disconnecting) {
         if (read_message(server) < 0) return -1;
     }
-    return 0;
+    return server->launch_received ? 0 : -1;
 }
 
 void DAP_ProcessExited(DAPServer *server, int exit_code) {
@@ -643,4 +1089,36 @@ void DAP_SendOutput(DAPServer *server, const char *category, const char *output)
     JS_SetPropertyStr(server->ctx, body, "category", JS_NewString(server->ctx, category));
     JS_SetPropertyStr(server->ctx, body, "output", JS_NewString(server->ctx, output));
     dap_send_event(server, "output", body);
+}
+
+int DAP_SetLogFile(DAPServer *server, const char *path) {
+    FILE *fp = fopen(path, "w");
+    if (!fp)
+        return -1;
+    server->log_fp = fp;
+    return 0;
+}
+
+void DAP_PrepareExecution(DAPServer *server) {
+    if (server->launch_stop_on_entry) {
+        server->entry_stop_pending = true;
+        server->debug_state->stop_on_entry = true;
+        JS_DebugStepInto(server->debug_state);
+    }
+}
+
+const char *DAP_GetLaunchProgram(DAPServer *server) {
+    return server->launch_program;
+}
+
+const char * const *DAP_GetLaunchArgs(DAPServer *server) {
+    return (const char * const *)server->launch_args;
+}
+
+int DAP_GetLaunchArgc(DAPServer *server) {
+    return server->launch_argc;
+}
+
+int DAP_GetLaunchModule(DAPServer *server) {
+    return server->launch_module;
 }

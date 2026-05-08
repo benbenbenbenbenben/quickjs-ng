@@ -1032,37 +1032,243 @@ static void new_symbol(void)
 #ifdef QJS_ENABLE_DAP
 #include "qjs-debug.h"
 
-static int test_dap_pause_count = 0;
+typedef struct {
+    JSDebugState *ds;
+    int pause_count;
+    int expected_breakpoint_id;
+    bool saw_debugger;
+    bool saw_stack;
+    bool saw_globals;
+    bool saw_conditional;
+} TestDAPState;
 
-static int test_dap_pause_cb(JSRuntime *rt, void *opaque, JSDebugReason reason, const uint8_t *pc) {
-    test_dap_pause_count++;
-    JSDebugState *ds = (JSDebugState *)opaque;
-    JS_DebugContinue(ds); // Automatically resume after pausing
+static void free_stack_frames(JSContext *ctx, JSStackFrameInfo *frames, int count)
+{
+    if (!frames)
+        return;
+    for (int i = 0; i < count; i++) {
+        JS_FreeValue(ctx, frames[i].func);
+        if (frames[i].filename != JS_ATOM_NULL)
+            JS_FreeAtom(ctx, frames[i].filename);
+        if (frames[i].func_name != JS_ATOM_NULL)
+            JS_FreeAtom(ctx, frames[i].func_name);
+    }
+    js_free(ctx, frames);
+}
+
+static void free_var_infos(JSContext *ctx, JSVarInfo *vars, int count)
+{
+    if (!vars)
+        return;
+    for (int i = 0; i < count; i++) {
+        JS_FreeAtom(ctx, vars[i].name);
+        JS_FreeValue(ctx, vars[i].value);
+    }
+    js_free(ctx, vars);
+}
+
+static int find_var_info(JSContext *ctx, JSVarInfo *vars, int count, const char *name)
+{
+    for (int i = 0; i < count; i++) {
+        const char *var_name = JS_AtomToCString(ctx, vars[i].name);
+        int match = var_name && strcmp(var_name, name) == 0;
+        if (var_name)
+            JS_FreeCString(ctx, var_name);
+        if (match)
+            return i;
+    }
+    return -1;
+}
+
+static int value_to_int32(JSContext *ctx, JSValueConst value)
+{
+    int32_t out = 0;
+    assert(JS_ToInt32(ctx, &out, value) == 0);
+    return out;
+}
+
+static int test_dap_breakpoint_cb(JSRuntime *rt, void *opaque, JSDebugReason reason, const uint8_t *pc)
+{
+    TestDAPState *state = opaque;
+    JSDebugState *ds = state->ds;
+    JSContext *ctx = ds->ctx;
+    JSStackFrameInfo *frames = NULL;
+    JSVarInfo *vars = NULL;
+    JSVarInfo *globals = NULL;
+    JSValue eval_result = JS_UNDEFINED;
+    JSValue value = JS_UNDEFINED;
+    int frame_count;
+    int var_count;
+    int global_count;
+
+    (void)rt;
+    (void)pc;
+
+    state->pause_count++;
+    if (reason == JS_DEBUG_REASON_DEBUGGER) {
+        state->saw_debugger = true;
+        JS_DebugContinue(ds);
+        return 0;
+    }
+
+    assert(reason == JS_DEBUG_REASON_BREAKPOINT);
+    assert(ds->stop_breakpoint_id == state->expected_breakpoint_id);
+    frame_count = JS_GetStackTrace(ctx, &frames, 8);
+    assert(frame_count > 0);
+    assert(frames[0].func_name != JS_ATOM_NULL);
+    {
+        const char *func_name = JS_AtomToCString(ctx, frames[0].func_name);
+        assert(func_name);
+        assert(strcmp(func_name, "target") == 0);
+        JS_FreeCString(ctx, func_name);
+    }
+    state->saw_stack = true;
+
+    var_count = JS_GetFrameLocals(ctx, 0, &vars);
+    assert(var_count >= 3);
+    {
+        int x_index = find_var_info(ctx, vars, var_count, "x");
+        int y_index = find_var_info(ctx, vars, var_count, "y");
+        assert(x_index >= 0);
+        assert(y_index >= 0);
+        assert(value_to_int32(ctx, vars[x_index].value) == 42);
+        assert(value_to_int32(ctx, vars[y_index].value) == 84);
+    }
+
+    eval_result = JS_EvaluateAtFrame(ctx, 0, "globalThis.global_value", strlen("globalThis.global_value"));
+    assert(!JS_IsException(eval_result));
+    assert(value_to_int32(ctx, eval_result) == 1);
+    JS_FreeValue(ctx, eval_result);
+    eval_result = JS_UNDEFINED;
+
+    value = JS_NewInt32(ctx, 100);
+    assert(JS_SetFrameLocal(ctx, 0, "x", value) == 0);
+    JS_FreeValue(ctx, value);
+    value = JS_NewInt32(ctx, 7);
+    assert(JS_SetGlobalVariable(ctx, "global_value", value) == 0);
+    JS_FreeValue(ctx, value);
+
+    free_var_infos(ctx, vars, var_count);
+    vars = NULL;
+    var_count = JS_GetFrameLocals(ctx, 0, &vars);
+    assert(var_count >= 3);
+    {
+        int x_index = find_var_info(ctx, vars, var_count, "x");
+        assert(x_index >= 0);
+        assert(value_to_int32(ctx, vars[x_index].value) == 100);
+    }
+
+    global_count = JS_GetGlobalVariables(ctx, &globals);
+    assert(global_count > 0);
+    {
+        int global_index = find_var_info(ctx, globals, global_count, "global_value");
+        assert(global_index >= 0);
+        assert(value_to_int32(ctx, globals[global_index].value) == 7);
+    }
+    state->saw_globals = true;
+
+    free_var_infos(ctx, globals, global_count);
+    free_var_infos(ctx, vars, var_count);
+    free_stack_frames(ctx, frames, frame_count);
+    JS_DebugContinue(ds);
     return 0;
 }
 
-static void test_dap_breakpoints(void) {
+static void test_dap_breakpoints(void)
+{
+    static const char code[] =
+        "globalThis.global_value = 1;\n"
+        "function target(a) {\n"
+        "  let x = a + 1;\n"
+        "  let y = x * 2;\n"
+        "  x += 1;\n"
+        "  debugger;\n"
+        "  return x + y + globalThis.global_value;\n"
+        "}\n"
+        "target(41);\n";
     JSRuntime *rt = new_runtime();
     JSContext *ctx = JS_NewContext(rt);
-    
+    TestDAPState state = {0};
     JSDebugState *ds = JS_NewDebugState(ctx);
-    test_dap_pause_count = 0;
-    ds->pause_callback = test_dap_pause_cb;
+    JSValue ret;
+
+    state.ds = ds;
+    ds->pause_callback = test_dap_breakpoint_cb;
+    ds->user_opaque = &state;
     JS_SetDebugHandler(rt, js_debug_handler, ds);
-    
-    const char *code = "function f() { var x = 1; x++; return x; }\nf();";
-    JS_AddBreakpoint(ds, "<input>", 1, NULL); // Line 1
-    
-    JSValue ret = JS_Eval(ctx, code, strlen(code), "<input>", 0);
+    state.expected_breakpoint_id = JS_AddBreakpoint(ds, "<input>", 5, NULL);
+
+    ret = JS_Eval(ctx, code, strlen(code), "<input>", 0);
     assert(!JS_IsException(ret));
+    assert(JS_IsNumber(ret));
     JS_FreeValue(ctx, ret);
-    
-    assert(test_dap_pause_count > 0);
-    
+
+    JS_ClearBreakpoints(ds, "<input>");
+    assert(ds->bp_count == 0);
     JS_FreeDebugState(ds);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 }
+
+static int test_dap_conditional_cb(JSRuntime *rt, void *opaque, JSDebugReason reason, const uint8_t *pc)
+{
+    TestDAPState *state = opaque;
+    JSDebugState *ds = state->ds;
+    JSContext *ctx = ds->ctx;
+    JSVarInfo *vars = NULL;
+    int count;
+
+    (void)rt;
+    (void)pc;
+
+    state->pause_count++;
+    assert(reason == JS_DEBUG_REASON_BREAKPOINT);
+    assert(ds->stop_breakpoint_id == state->expected_breakpoint_id);
+    count = JS_GetFrameLocals(ctx, 0, &vars);
+    assert(count > 0);
+    {
+        int i_index = find_var_info(ctx, vars, count, "i");
+        assert(i_index >= 0);
+        assert(value_to_int32(ctx, vars[i_index].value) == 2);
+    }
+    state->saw_conditional = true;
+    free_var_infos(ctx, vars, count);
+    JS_DebugContinue(ds);
+    return 0;
+}
+
+static void test_dap_conditional_breakpoints(void)
+{
+    static const char code[] =
+        "let total = 0;\n"
+        "for (let i = 0; i < 4; i++) {\n"
+        "  total += i;\n"
+        "}\n"
+        "total;\n";
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    TestDAPState state = {0};
+    JSDebugState *ds = JS_NewDebugState(ctx);
+    JSValue ret;
+    int32_t result;
+
+    state.ds = ds;
+    ds->pause_callback = test_dap_conditional_cb;
+    ds->user_opaque = &state;
+    JS_SetDebugHandler(rt, js_debug_handler, ds);
+    state.expected_breakpoint_id = JS_AddBreakpoint(ds, "<input>", 3, "i === 2");
+
+    ret = JS_Eval(ctx, code, strlen(code), "<input>", 0);
+    assert(!JS_IsException(ret));
+    assert(JS_ToInt32(ctx, &result, ret) == 0);
+    assert(result == 6);
+    JS_FreeValue(ctx, ret);
+
+    JS_FreeDebugState(ds);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 #endif
 
 int main(void)
@@ -1087,6 +1293,7 @@ int main(void)
     new_symbol();
 #ifdef QJS_ENABLE_DAP
     test_dap_breakpoints();
+    test_dap_conditional_breakpoints();
 #endif
     return 0;
 }

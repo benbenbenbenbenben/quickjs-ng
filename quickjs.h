@@ -826,6 +826,7 @@ static inline bool JS_IsModule(JSValueConst v)
 
 JS_EXTERN JSValue JS_Throw(JSContext *ctx, JSValue obj);
 JS_EXTERN JSValue JS_GetException(JSContext *ctx);
+JS_EXTERN JSValue JS_PeekException(JSContext *ctx);
 JS_EXTERN bool JS_HasException(JSContext *ctx);
 JS_EXTERN bool JS_IsError(JSValueConst val);
 JS_EXTERN bool JS_IsUncatchableError(JSValueConst val);
@@ -1187,6 +1188,8 @@ typedef struct JSVarInfo {
 JS_EXTERN int JS_GetFrameLocals(JSContext *ctx, int frame_index, JSVarInfo **vars);
 JS_EXTERN JSValue JS_EvaluateAtFrame(JSContext *ctx, int frame_index, const char *expr, size_t expr_len);
 JS_EXTERN int JS_GetGlobalVariables(JSContext *ctx, JSVarInfo **vars);
+JS_EXTERN int JS_SetFrameLocal(JSContext *ctx, int frame_index, const char *name, JSValueConst value);
+JS_EXTERN int JS_SetGlobalVariable(JSContext *ctx, const char *name, JSValueConst value);
 JS_EXTERN int JS_GetPCLineNumber(JSContext *ctx, JSValueConst func, uint32_t pc);
 
 /* if can_block is true, Atomics.wait() can be used */

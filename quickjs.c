@@ -299,6 +299,7 @@ struct JSRuntime {
     uintptr_t stack_limit; /* lower stack limit */
 
     JSValue current_exception;
+    JSValue last_thrown_exception;
     /* true if inside an out of memory error, to avoid recursing */
     bool in_out_of_memory;
     /* true if inside build_backtrace, to avoid recursing */
@@ -1997,6 +1998,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     JS_UpdateStackTop(rt);
 
     rt->current_exception = JS_UNINITIALIZED;
+    rt->last_thrown_exception = JS_UNINITIALIZED;
 
     return rt;
  fail:
@@ -2280,6 +2282,7 @@ void JS_FreeRuntime(JSRuntime *rt)
 
     rt->in_free = true;
     JS_FreeValueRT(rt, rt->current_exception);
+    JS_FreeValueRT(rt, rt->last_thrown_exception);
 
     list_for_each_safe(el, el1, &rt->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
@@ -7580,7 +7583,9 @@ JSValue JS_Throw(JSContext *ctx, JSValue obj)
 {
     JSRuntime *rt = ctx->rt;
     JS_FreeValue(ctx, rt->current_exception);
+    JS_FreeValue(ctx, rt->last_thrown_exception);
     rt->current_exception = obj;
+    rt->last_thrown_exception = JS_DupValue(ctx, obj);
     
 #ifdef QJS_ENABLE_DAP
     if (unlikely(rt->debug_enabled)) {
@@ -7599,6 +7604,15 @@ JSValue JS_GetException(JSContext *ctx)
     val = rt->current_exception;
     rt->current_exception = JS_UNINITIALIZED;
     return val;
+}
+
+JSValue JS_PeekException(JSContext *ctx)
+{
+    if (JS_HasException(ctx))
+        return JS_DupValue(ctx, ctx->rt->current_exception);
+    if (!JS_IsUninitialized(ctx->rt->last_thrown_exception))
+        return JS_DupValue(ctx, ctx->rt->last_thrown_exception);
+    return JS_UNDEFINED;
 }
 
 bool JS_HasException(JSContext *ctx)
@@ -62120,13 +62134,91 @@ int JS_GetFrameLocals(JSContext *ctx, int frame_index, JSVarInfo **vars)
     return total_vars;
 }
 
+static bool js_is_simple_identifier(const char *name)
+{
+    size_t i;
+    unsigned char c;
+
+    if (!name || !name[0])
+        return false;
+    c = (unsigned char)name[0];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '$'))
+        return false;
+    for (i = 1; name[i]; i++) {
+        c = (unsigned char)name[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '$'))
+            return false;
+    }
+    return true;
+}
+
+static void js_free_var_info_array(JSContext *ctx, JSVarInfo *vars, int count)
+{
+    int i;
+
+    if (!vars)
+        return;
+    for (i = 0; i < count; i++) {
+        JS_FreeAtom(ctx, vars[i].name);
+        JS_FreeValue(ctx, vars[i].value);
+    }
+    js_free(ctx, vars);
+}
+
 JSValue JS_EvaluateAtFrame(JSContext *ctx, int frame_index, const char *expr, size_t expr_len)
 {
-    // Real implementation requires evaluating in the specific lexical environment.
-    // For now, this evaluates in the global scope if not fully implemented in quickjs.c.
-    // A complete implementation would involve setting up a custom JS_EVAL_FLAG_COMPILE_ONLY 
-    // and manually patching the closure vars, or just running in global context.
-    return JS_Eval(ctx, expr, expr_len, "<eval>", JS_EVAL_TYPE_GLOBAL);
+    JSVarInfo *vars = NULL;
+    JSValue func = JS_UNDEFINED;
+    JSValue locals = JS_UNDEFINED;
+    JSValue ret = JS_EXCEPTION;
+    int count, i;
+    DynBuf dbuf;
+
+    count = JS_GetFrameLocals(ctx, frame_index, &vars);
+    if (count < 0)
+        return JS_ThrowReferenceError(ctx, "invalid frame index");
+    if (count == 0)
+        return JS_Eval(ctx, expr, expr_len, "<eval>", JS_EVAL_TYPE_GLOBAL);
+
+    dbuf_init(&dbuf);
+    dbuf_putstr(&dbuf, "(function(__qjs_locals__){");
+    for (i = 0; i < count; i++) {
+        const char *name = JS_AtomToCString(ctx, vars[i].name);
+        if (name && js_is_simple_identifier(name)) {
+            dbuf_putstr(&dbuf, "var ");
+            dbuf_putstr(&dbuf, name);
+            dbuf_printf(&dbuf, " = __qjs_locals__[%d];", i);
+        }
+        if (name)
+            JS_FreeCString(ctx, name);
+    }
+    dbuf_putstr(&dbuf, "return (");
+    dbuf_put(&dbuf, expr, expr_len);
+    dbuf_putstr(&dbuf, ");})");
+    dbuf_putc(&dbuf, '\0');
+    if (dbuf_error(&dbuf)) {
+        dbuf_free(&dbuf);
+        js_free_var_info_array(ctx, vars, count);
+        return JS_EXCEPTION;
+    }
+
+    func = JS_Eval(ctx, (const char *)dbuf.buf, dbuf.size - 1, "<eval>", JS_EVAL_TYPE_GLOBAL);
+    dbuf_free(&dbuf);
+    if (JS_IsException(func)) {
+        js_free_var_info_array(ctx, vars, count);
+        return func;
+    }
+
+    locals = JS_NewArray(ctx);
+    for (i = 0; i < count; i++) {
+        JS_SetPropertyUint32(ctx, locals, i, JS_DupValue(ctx, vars[i].value));
+    }
+    ret = JS_Call(ctx, func, JS_UNDEFINED, 1, (JSValueConst *)&locals);
+    JS_FreeValue(ctx, locals);
+    JS_FreeValue(ctx, func);
+    js_free_var_info_array(ctx, vars, count);
+    return ret;
 }
 
 int JS_GetGlobalVariables(JSContext *ctx, JSVarInfo **vars)
@@ -62154,6 +62246,56 @@ int JS_GetGlobalVariables(JSContext *ctx, JSVarInfo **vars)
     js_free(ctx, ptab);
     JS_FreeValue(ctx, global);
     return plen;
+}
+
+int JS_SetFrameLocal(JSContext *ctx, int frame_index, const char *name, JSValueConst value)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    JSAtom name_atom;
+    int curr_idx = 0;
+
+    while (sf != NULL && curr_idx < frame_index) {
+        sf = sf->prev_frame;
+        curr_idx++;
+    }
+    if (!sf || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+        return -1;
+
+    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return -1;
+
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    if (!b || !b->vardefs)
+        return -1;
+
+    name_atom = JS_NewAtom(ctx, name);
+    if (name_atom == JS_ATOM_NULL)
+        return -1;
+
+    for (int i = 0; i < b->arg_count + b->var_count; i++) {
+        JSVarDef *vd = &b->vardefs[i];
+        if (vd->var_name != name_atom)
+            continue;
+        if (i < b->arg_count) {
+            set_value(ctx, &sf->arg_buf[i], JS_DupValue(ctx, value));
+        } else {
+            set_value(ctx, &sf->var_buf[i - b->arg_count], JS_DupValue(ctx, value));
+        }
+        JS_FreeAtom(ctx, name_atom);
+        return 0;
+    }
+
+    JS_FreeAtom(ctx, name_atom);
+    return -1;
+}
+
+int JS_SetGlobalVariable(JSContext *ctx, const char *name, JSValueConst value)
+{
+    JSValue global = JS_GetGlobalObject(ctx);
+    int ret = JS_SetPropertyStr(ctx, global, name, JS_DupValue(ctx, value));
+    JS_FreeValue(ctx, global);
+    return ret < 0 ? -1 : 0;
 }
 
 #undef malloc

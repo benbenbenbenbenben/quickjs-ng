@@ -172,6 +172,23 @@ jobs:
         run: |
           ./build/lre-test
 
+  dap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - name: build with DAP
+        run: |
+          cmake -B build-dap -DQJS_ENABLE_DAP=ON
+          cmake --build build-dap --target qjs_exe api-test -j2
+      - name: test DAP api
+        run: |
+          ./build-dap/api-test
+      - name: test DAP integration
+        run: |
+          python3 tests/test_dap.py ./build-dap/qjs
+
   windows-msvc:
     runs-on: ${{ matrix.config.os }}
     strategy:

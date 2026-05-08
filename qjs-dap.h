@@ -7,10 +7,17 @@
 extern "C" {
 #endif
 
+#if defined(_WIN32) || (!defined(__wasi__) && !defined(__EMSCRIPTEN__))
+#define QJS_DAP_HAVE_SOCKETS 1
+#else
+#define QJS_DAP_HAVE_SOCKETS 0
+#endif
+
 typedef struct DAPTransport DAPTransport;
 struct DAPTransport {
     int (*recv)(DAPTransport *t, char *buf, size_t len);
     int (*send)(DAPTransport *t, const char *buf, size_t len);
+    int (*poll)(DAPTransport *t, int timeout_ms);
     void (*close)(DAPTransport *t);
     void *opaque;
 };
@@ -41,6 +48,12 @@ DAPTransport *DAP_NewTCPTransport(int port);
 
 /* Setup JS output redirection so print/console.log go to DAP */
 void DAP_SetupOutputRedirection(DAPServer *server);
+int DAP_SetLogFile(DAPServer *server, const char *path);
+void DAP_PrepareExecution(DAPServer *server);
+const char *DAP_GetLaunchProgram(DAPServer *server);
+const char * const *DAP_GetLaunchArgs(DAPServer *server);
+int DAP_GetLaunchArgc(DAPServer *server);
+int DAP_GetLaunchModule(DAPServer *server);
 
 #ifdef __cplusplus
 }

@@ -394,8 +394,9 @@ void help(void)
            "-o  --out FILE     output file for standalone executables\n"
            "    --exe          select the executable to use as the base, defaults to the current one\n"
            "    --memory-limit n       limit the memory usage to 'n' Kbytes\n"
-           "    --stack-size n         limit the stack size to 'n' Kbytes\n"
-           "-q  --quit         just instantiate the interpreter and quit\n", JS_GetVersion());
+            "    --stack-size n         limit the stack size to 'n' Kbytes\n"
+           "    --dap-log FILE         write DAP protocol diagnostics to FILE\n"
+            "-q  --quit         just instantiate the interpreter and quit\n", JS_GetVersion());
     exit(1);
 }
 
@@ -426,9 +427,13 @@ int main(int argc, char **argv)
     int i, include_count = 0;
     int64_t memory_limit = -1;
     int64_t stack_size = -1;
+    int helper_argc = 0;
+    char **helper_argv = NULL;
+    bool helper_argv_owned = false;
 #ifdef QJS_ENABLE_DAP
     int use_dap = 0;
     int dap_port = -1;
+    char *dap_log = NULL;
 #endif
 
     /* save for later */
@@ -590,6 +595,17 @@ int main(int argc, char **argv)
                 fprintf(stderr, "qjs: unknown option '-%c'\n", opt);
             } else {
 #ifdef QJS_ENABLE_DAP
+                if (!strcmp(longopt, "dap-log")) {
+                    if (!optarg) {
+                        if (optind >= argc) {
+                            fprintf(stderr, "qjs: missing file for --dap-log\n");
+                            exit(1);
+                        }
+                        optarg = argv[optind++];
+                    }
+                    dap_log = optarg;
+                    break;
+                }
                 if (!strncmp(longopt, "dap", 3)) {
                     use_dap = 1;
                     if (optarg && !strncmp(optarg, "tcp:", 4)) {
@@ -606,6 +622,12 @@ int main(int argc, char **argv)
 
     if (compile_file && !out)
         help();
+#ifdef QJS_ENABLE_DAP
+    if (dap_log && !use_dap) {
+        fprintf(stderr, "qjs: --dap-log requires --dap\n");
+        exit(1);
+    }
+#endif
 
 start:
 
@@ -647,13 +669,66 @@ start:
     DAPServer *dap_server = NULL;
     if (use_dap) {
         DAPTransport *t = dap_port > 0 ? DAP_NewTCPTransport(dap_port) : DAP_NewStdioTransport();
+        if (!t) {
+            r = 1;
+            goto fail;
+        }
         dap_server = DAP_NewServer(ctx, t);
-        DAP_WaitForLaunch(dap_server);
+        if (!dap_server) {
+            fprintf(stderr, "qjs: failed to initialize DAP server\n");
+            t->close(t);
+            r = 1;
+            goto fail;
+        }
+        if (dap_log && DAP_SetLogFile(dap_server, dap_log) < 0) {
+            fprintf(stderr, "qjs: failed to open DAP log file '%s'\n", dap_log);
+            r = 1;
+            goto fail;
+        }
+        if (DAP_WaitForLaunch(dap_server) < 0) {
+            fprintf(stderr, "qjs: DAP session initialization failed\n");
+            r = 1;
+            goto fail;
+        }
     }
 #endif
 
     if (!empty_run) {
-        js_std_add_helpers(ctx, argc - optind, argv + optind);
+#ifdef QJS_ENABLE_DAP
+        if (use_dap) {
+            const char *dap_program = DAP_GetLaunchProgram(dap_server);
+            const char * const *dap_args = DAP_GetLaunchArgs(dap_server);
+            int dap_argc = DAP_GetLaunchArgc(dap_server);
+
+            if (standalone || compile_file || expr || interactive || include_count > 0 || optind < argc) {
+                fprintf(stderr, "qjs: --dap requires the target program to be provided by the DAP launch request\n");
+                goto fail;
+            }
+            if (!dap_program) {
+                fprintf(stderr, "qjs: DAP launch request did not provide a program\n");
+                goto fail;
+            }
+            if (DAP_GetLaunchModule(dap_server) != -1)
+                module = DAP_GetLaunchModule(dap_server);
+
+            helper_argc = dap_argc + 1;
+            helper_argv = malloc(sizeof(*helper_argv) * helper_argc);
+            if (!helper_argv) {
+                fprintf(stderr, "qjs: failed to allocate DAP launch arguments\n");
+                goto fail;
+            }
+            helper_argv_owned = true;
+            helper_argv[0] = (char *)dap_program;
+            for (i = 0; i < dap_argc; i++)
+                helper_argv[i + 1] = (char *)dap_args[i];
+            js_std_add_helpers(ctx, helper_argc, helper_argv);
+        } else
+#endif
+        {
+            helper_argc = argc - optind;
+            helper_argv = argv + optind;
+            js_std_add_helpers(ctx, helper_argc, helper_argv);
+        }
 
 #ifdef QJS_ENABLE_DAP
         if (use_dap && dap_server) {
@@ -678,7 +753,11 @@ start:
                 goto fail;
         }
 
-        if (standalone) {
+        if (use_dap) {
+            DAP_PrepareExecution(dap_server);
+            if (eval_file(ctx, DAP_GetLaunchProgram(dap_server), module))
+                goto fail;
+        } else if (standalone) {
             JSValue ns = load_standalone_module(ctx);
             if (JS_IsException(ns))
                 goto fail;
@@ -784,8 +863,12 @@ start:
                best[1] + best[2] + best[3] + best[4],
                best[1], best[2], best[3], best[4]);
     }
+    if (helper_argv_owned)
+        free(helper_argv);
     return 0;
  fail:
+    if (helper_argv_owned)
+        free(helper_argv);
     js_std_free_handlers(rt);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);

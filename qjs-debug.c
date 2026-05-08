@@ -2,6 +2,33 @@
 #include <string.h>
 #include <stdlib.h>
 
+static void js_debug_clear_stop_state(JSDebugState *ds)
+{
+    if (JS_IsException(ds->stop_exception) || JS_IsUninitialized(ds->stop_exception))
+        ds->stop_exception = JS_UNDEFINED;
+    if (!JS_IsUndefined(ds->stop_exception))
+        JS_FreeValue(ds->ctx, ds->stop_exception);
+    ds->stop_exception = JS_UNDEFINED;
+    ds->stop_exception_uncatchable = false;
+    ds->stop_breakpoint_id = 0;
+    ds->stop_reason = JS_DEBUG_REASON_POLL;
+    ds->has_stop_state = false;
+}
+
+static void js_debug_capture_exception_state(JSContext *ctx, JSDebugState *ds)
+{
+    JSValue exception;
+
+    if (!JS_HasException(ctx))
+        return;
+
+    exception = JS_PeekException(ctx);
+    if (JS_IsUndefined(exception))
+        return;
+    ds->stop_exception_uncatchable = JS_IsUncatchableError(exception);
+    ds->stop_exception = exception;
+}
+
 JSDebugState *JS_NewDebugState(JSContext *ctx) {
     JSDebugState *ds = js_mallocz(ctx, sizeof(JSDebugState));
     if (!ds) return NULL;
@@ -13,14 +40,18 @@ JSDebugState *JS_NewDebugState(JSContext *ctx) {
     ds->next_bp_id = 1;
     ds->is_evaluating = false;
     ds->pause_on_exceptions = false;
+    ds->stop_on_entry = false;
     ds->last_func = JS_UNDEFINED;
     ds->last_pc = 0;
     ds->last_line = -1;
+    ds->stop_exception = JS_UNDEFINED;
+    ds->stop_reason = JS_DEBUG_REASON_POLL;
     return ds;
 }
 
 void JS_FreeDebugState(JSDebugState *ds) {
     if (!ds) return;
+    js_debug_clear_stop_state(ds);
     for (int i = 0; i < ds->bp_count; i++) {
         JS_FreeAtom(ds->ctx, ds->breakpoints[i].filename);
         if (ds->breakpoints[i].condition) {
@@ -68,6 +99,7 @@ void JS_ClearBreakpoints(JSDebugState *ds, const char *filename) {
 }
 
 void JS_DebugStepInto(JSDebugState *ds) {
+    js_debug_clear_stop_state(ds);
     ds->step_mode = STEP_INTO;
     ds->step_depth = JS_GetStackDepth(ds->ctx);
     ds->step_pc = 0;
@@ -75,6 +107,8 @@ void JS_DebugStepInto(JSDebugState *ds) {
 }
 
 void JS_DebugStepOver(JSDebugState *ds) {
+    js_debug_clear_stop_state(ds);
+    ds->stop_on_entry = false;
     ds->step_mode = STEP_OVER;
     ds->step_depth = JS_GetStackDepth(ds->ctx);
     ds->step_pc = 0; // The actual PC is handled dynamically in poll
@@ -82,6 +116,8 @@ void JS_DebugStepOver(JSDebugState *ds) {
 }
 
 void JS_DebugStepOut(JSDebugState *ds) {
+    js_debug_clear_stop_state(ds);
+    ds->stop_on_entry = false;
     ds->step_mode = STEP_OUT;
     ds->step_depth = JS_GetStackDepth(ds->ctx);
     ds->step_pc = 0;
@@ -89,6 +125,8 @@ void JS_DebugStepOut(JSDebugState *ds) {
 }
 
 void JS_DebugContinue(JSDebugState *ds) {
+    js_debug_clear_stop_state(ds);
+    ds->stop_on_entry = false;
     ds->step_mode = STEP_NONE;
     ds->paused = false;
 }
@@ -112,6 +150,8 @@ int js_debug_handler(JSRuntime *rt, void *opaque, JSDebugReason reason, const ui
     JSContext *ctx = ds->ctx;
 
     bool should_pause = false;
+    JSDebugReason pause_reason = reason;
+    int stop_breakpoint_id = 0;
 
     if (reason == JS_DEBUG_REASON_DEBUGGER) {
         should_pause = true;
@@ -133,16 +173,20 @@ int js_debug_handler(JSRuntime *rt, void *opaque, JSDebugReason reason, const ui
                 if (ds->step_mode == STEP_INTO) {
                     if (frame->line != ds->last_line || current_depth != ds->step_depth) {
                         should_pause = true;
+                        pause_reason = ds->stop_on_entry ? JS_DEBUG_REASON_ENTRY : JS_DEBUG_REASON_STEP;
                     }
                 } else if (ds->step_mode == STEP_OVER) {
                     if (current_depth < ds->step_depth) {
                         should_pause = true;
+                        pause_reason = JS_DEBUG_REASON_STEP;
                     } else if (current_depth == ds->step_depth && frame->line != ds->last_line) {
                         should_pause = true;
+                        pause_reason = JS_DEBUG_REASON_STEP;
                     }
                 } else if (ds->step_mode == STEP_OUT) {
                     if (current_depth < ds->step_depth) {
                         should_pause = true;
+                        pause_reason = JS_DEBUG_REASON_STEP;
                     }
                 }
             }
@@ -155,10 +199,14 @@ int js_debug_handler(JSRuntime *rt, void *opaque, JSDebugReason reason, const ui
                         if (bp->condition) {
                             if (evaluate_condition(ctx, ds, bp->condition)) {
                                 should_pause = true;
+                                pause_reason = JS_DEBUG_REASON_BREAKPOINT;
+                                stop_breakpoint_id = bp->id;
                                 break;
                             }
                         } else {
                             should_pause = true;
+                            pause_reason = JS_DEBUG_REASON_BREAKPOINT;
+                            stop_breakpoint_id = bp->id;
                             break;
                         }
                     }
@@ -176,8 +224,15 @@ int js_debug_handler(JSRuntime *rt, void *opaque, JSDebugReason reason, const ui
     if (ds->paused || should_pause) {
         ds->paused = true;
         ds->step_mode = STEP_NONE; // Reset stepping once paused
+        ds->stop_on_entry = false;
+        js_debug_clear_stop_state(ds);
+        ds->has_stop_state = true;
+        ds->stop_reason = pause_reason;
+        ds->stop_breakpoint_id = stop_breakpoint_id;
+        if (pause_reason == JS_DEBUG_REASON_EXCEPTION)
+            js_debug_capture_exception_state(ctx, ds);
         if (ds->pause_callback) {
-            ds->pause_callback(rt, ds->user_opaque ? ds->user_opaque : opaque, reason, pc);
+            ds->pause_callback(rt, ds->user_opaque ? ds->user_opaque : opaque, pause_reason, pc);
         }
     }
 
