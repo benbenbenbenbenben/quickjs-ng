@@ -9960,6 +9960,7 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
         if (len < old_len) {
             for(i = len; i < old_len; i++) {
                 JS_FreeValue(ctx, p->u.array.u.values[i]);
+                p->u.array.u.values[i] = JS_UNDEFINED;
             }
             p->u.array.count = len;
         }
@@ -10309,12 +10310,11 @@ retry:
         goto done;
     }
 
-    if (unlikely(!p->extensible)) {
-        ret = JS_ThrowTypeErrorOrFalse(ctx, flags, "object is not extensible");
-        goto done;
-    }
-
     if (p == JS_VALUE_GET_OBJ(obj)) {
+        if (unlikely(!p->extensible)) {
+            ret = JS_ThrowTypeErrorOrFalse(ctx, flags, "object is not extensible");
+            goto done;
+        }
         if (p->is_exotic) {
             if (p->class_id == JS_CLASS_ARRAY && p->fast_array &&
                 __JS_AtomIsTaggedInt(prop)) {
@@ -10365,6 +10365,10 @@ retry:
                                 JS_UNDEFINED, JS_UNDEFINED,
                                 JS_PROP_HAS_VALUE);
     } else {
+        if (unlikely(!p->extensible)) {
+            ret = JS_ThrowTypeErrorOrFalse(ctx, flags, "object is not extensible");
+            goto done;
+        }
     generic_create_prop:
         ret = JS_CreateProperty(ctx, p, prop, val, JS_UNDEFINED, JS_UNDEFINED,
                                 flags |
@@ -23540,7 +23544,7 @@ static int find_var(JSContext *ctx, JSFunctionDef *fd, JSAtom name)
         if (i == -1)
             goto not_found;
         vd = &fd->vars[i];
-        if (fd->vars[i].scope_level == 0)
+        if (vd->scope_level == 0)
             return i;
     }
     for(i = fd->var_count; i-- > 0;) {
